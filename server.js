@@ -25,7 +25,22 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
-  origin: ['https://www.typyzpiwnicy.pl', 'https://typyzpiwnicy.pl'],
+  origin: function(origin, callback) {
+    const allowed = [
+      'https://www.typyzpiwnicy.pl',
+      'https://typyzpiwnicy.pl',
+      'http://localhost:3000',
+      'http://localhost:3001',
+      'http://localhost:5500',
+      'http://127.0.0.1:5500'
+    ];
+    // Pozwala na zapytania bez origin (np. mobilki) lub te z listy allowed
+    if (!origin || allowed.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Błąd CORS: Ten adres nie ma uprawnień!'));
+    }
+  },
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
