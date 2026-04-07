@@ -25,7 +25,7 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
+  origin: ['https://www.typyzpiwnicy.pl', 'https://typyzpiwnicy.pl'],
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));
