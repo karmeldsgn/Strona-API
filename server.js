@@ -99,7 +99,7 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_bets_date ON bets(date);
   `);
 
-  // Dodaj kolumny Discord jeśli tabela users już istnieje (migracja)
+  // Dodaj kolumny jeśli tabela users już istnieje (migracja)
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_id TEXT UNIQUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_name TEXT;
@@ -110,6 +110,12 @@ async function initDB() {
     ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
     ALTER TABLE users ALTER COLUMN password_hash SET DEFAULT '';
   `).catch(() => {}); // ignoruj błędy jeśli kolumny już istnieją
+
+  // Migracja: Google i Facebook OAuth
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS facebook_id TEXT UNIQUE;
+  `).catch(() => {});
 
   console.log('✅ Database initialized');
 }
@@ -369,7 +375,7 @@ app.get('/api/auth/discord/callback', async (req, res) => {
       tax_enabled: user.tax_enabled
     }));
 
-    res.redirect(`${FRONTEND}?discord_token=${token}&discord_user=${userParam}`);
+    res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
 
   } catch (err) {
     console.error('Discord callback error:', err.response?.data || err.message);
@@ -377,7 +383,200 @@ app.get('/api/auth/discord/callback', async (req, res) => {
   }
 });
 
+// ─── GOOGLE OAUTH ─────────────────────────────────────────────────────────────
+// KROK 1: Redirect do Google
+app.get('/api/auth/google', (req, res) => {
+  const params = new URLSearchParams({
+    client_id:     process.env.GOOGLE_CLIENT_ID,
+    redirect_uri:  process.env.GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    scope:         'openid email profile',
+    access_type:   'offline',
+    prompt:        'select_account',
+  });
+  res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`);
+});
+
+// KROK 2: Callback Google
+app.get('/api/auth/google/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const FRONTEND = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+
+  if (error || !code) {
+    return res.redirect(`${FRONTEND}?auth_error=google_cancelled`);
+  }
+
+  try {
+    // 1. Wymień code na token
+    const tokenRes = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      new URLSearchParams({
+        client_id:     process.env.GOOGLE_CLIENT_ID,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET,
+        grant_type:    'authorization_code',
+        code,
+        redirect_uri:  process.env.GOOGLE_REDIRECT_URI,
+      }),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+    const { access_token } = tokenRes.data;
+
+    // 2. Pobierz dane użytkownika
+    const userRes = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${access_token}` }
+    });
+    const g = userRes.data; // { sub, name, email, picture }
+
+    const username = (g.name || g.email.split('@')[0]).replace(/\s+/g, '_').substring(0, 50);
+    const avatar   = g.picture || null;
+
+    // 3. Upsert użytkownika po google_id
+    const { rows } = await pool.query(`
+      INSERT INTO users (google_id, username, email, avatar, password_hash)
+      VALUES ($1, $2, $3, $4, '')
+      ON CONFLICT (google_id) DO UPDATE SET
+        username = EXCLUDED.username,
+        email    = COALESCE(EXCLUDED.email, users.email),
+        avatar   = COALESCE(EXCLUDED.avatar, users.avatar)
+      RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+    `, [g.sub, username, g.email || null, avatar]);
+
+    const user = rows[0];
+    const token = jwt.sign(
+      { id: user.id, username: user.username },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    const userParam = encodeURIComponent(JSON.stringify({
+      id:          user.id,
+      username:    user.username,
+      email:       user.email,
+      avatar:      user.avatar,
+      is_premium:  user.is_premium,
+      language:    user.language,
+      tax_enabled: user.tax_enabled,
+    }));
+
+    res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
+
+  } catch (err) {
+    console.error('Google callback error:', err.response?.data || err.message);
+    res.redirect(`${FRONTEND}?auth_error=google_server_error`);
+  }
+});
+
+// ─── FACEBOOK OAUTH ────────────────────────────────────────────────────────────
+// KROK 1: Redirect do Facebook
+app.get('/api/auth/facebook', (req, res) => {
+  const params = new URLSearchParams({
+    client_id:     process.env.FACEBOOK_CLIENT_ID,
+    redirect_uri:  process.env.FACEBOOK_REDIRECT_URI,
+    response_type: 'code',
+    scope:         'email,public_profile',
+  });
+  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+});
+
+// KROK 2: Callback Facebook
+app.get('/api/auth/facebook/callback', async (req, res) => {
+  const { code, error } = req.query;
+  const FRONTEND = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+
+  if (error || !code) {
+    return res.redirect(`${FRONTEND}?auth_error=facebook_cancelled`);
+  }
+
+  try {
+    // 1. Wymień code na token
+    const tokenRes = await axios.get('https://graph.facebook.com/v19.0/oauth/access_token', {
+      params: {
+        client_id:     process.env.FACEBOOK_CLIENT_ID,
+        client_secret: process.env.FACEBOOK_CLIENT_SECRET,
+        redirect_uri:  process.env.FACEBOOK_REDIRECT_URI,
+        code,
+      }
+    });
+    const { access_token } = tokenRes.data;
+
+    // 2. Pobierz dane użytkownika
+    const userRes = await axios.get('https://graph.facebook.com/me', {
+      params: { fields: 'id,name,email,picture.type(large)', access_token }
+    });
+    const f = userRes.data; // { id, name, email, picture }
+
+    const username = (f.name || `fb_${f.id}`).replace(/\s+/g, '_').substring(0, 50);
+    const avatar   = f.picture?.data?.url || null;
+
+    // 3. Upsert użytkownika po facebook_id
+    const { rows } = await pool.query(`
+      INSERT INTO users (facebook_id, username, email, avatar, password_hash)
+      VALUES ($1, $2, $3, $4, '')
+      ON CONFLICT (facebook_id) DO UPDATE SET
+        username = EXCLUDED.username,
+        email    = COALESCE(EXCLUDED.email, users.email),
+        avatar   = COALESCE(EXCLUDED.avatar, users.avatar)
+      RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+    `, [f.id, username, f.email || null, avatar]);
+
+    const user = rows[0];
+    const token = jwt.sign(
+      { id: user.id, username: user.username },
+      process.env.JWT_SECRET,
+      { expiresIn: '30d' }
+    );
+
+    const userParam = encodeURIComponent(JSON.stringify({
+      id:          user.id,
+      username:    user.username,
+      email:       user.email,
+      avatar:      user.avatar,
+      is_premium:  user.is_premium,
+      language:    user.language,
+      tax_enabled: user.tax_enabled,
+    }));
+
+    res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
+
+  } catch (err) {
+    console.error('Facebook callback error:', err.response?.data || err.message);
+    res.redirect(`${FRONTEND}?auth_error=facebook_server_error`);
+  }
+});
+
 // ─── BETS ROUTES ──────────────────────────────────────────────────────────────
+
+// GET /api/bets/daily-limit — info o dziennym limicie kuponów
+app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    // Get user premium status
+    const { rows: userRows } = await pool.query(
+      'SELECT is_premium FROM users WHERE id=$1', [userId]
+    );
+    const isPremium = userRows[0]?.is_premium || false;
+    const dailyLimit = isPremium ? null : 2;
+
+    // Count today's bets
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*) as count FROM bets
+       WHERE user_id=$1 AND date=CURRENT_DATE`,
+      [userId]
+    );
+    const usedToday = parseInt(countRows[0]?.count || 0);
+
+    res.json({
+      used_today: usedToday,
+      daily_limit: dailyLimit ?? 2,
+      is_premium: isPremium,
+      can_add: isPremium || usedToday < 2
+    });
+  } catch (err) {
+    console.error('Daily limit error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/bets', authMiddleware, apiLimiter, async (req, res) => {
   const { status, limit = 200, offset = 0 } = req.query;
   let q = 'SELECT * FROM bets WHERE user_id=$1';
