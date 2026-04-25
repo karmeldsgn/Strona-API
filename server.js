@@ -1,5 +1,6 @@
 require('dotenv').config();
 const express = require('express');
+const path = require('path');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -682,6 +683,14 @@ Return ONLY valid JSON (no markdown, no backticks):
 
 // ─── HEALTH ───────────────────────────────────────────────────────────────────
 app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+
+// ─── FRONTEND STATIC ─────────────────────────────────────────────────────────
+// Serwuje gotowy frontend z folderu public, żeby można było odpalić całość jako jedną apkę.
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api/')) return next();
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 // ─── START ────────────────────────────────────────────────────────────────────
 initDB().then(() => {
