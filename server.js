@@ -643,6 +643,9 @@ app.post('/api/scan', authMiddleware, scanLimiter, upload.single('image'), async
   if (!req.file) return res.status(400).json({ error: 'No image provided' });
   if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'AI scanning not configured' });
 
+  // Klient może przesłać aktualną datę — jeśli nie, bierzemy serwerową
+  const today = req.body?.today || new Date().toISOString().split('T')[0];
+
   try {
     const b64 = req.file.buffer.toString('base64');
     const mime = req.file.mimetype;
@@ -659,21 +662,52 @@ app.post('/api/scan', authMiddleware, scanLimiter, upload.single('image'), async
           },
           {
             type: 'text',
-            text: `You are a betting slip analyzer. Analyze this betting slip image carefully.
-Determine status of each selection based on visual markers:
-- "won" = green color, checkmark ✓, "trafiony", "wygrany", "won"
-- "lost" = red, ✗ cross, "przegrany", "lost"
-- "pending" = no markers, not played yet
+            text: `You are a precise betting slip (kupon bukmacherski) analyzer. Today's date is ${today}.
 
-Return ONLY valid JSON (no markdown, no backticks):
-{"bookmaker":"name","stake":"amount","odds":"total odds","betType":"single or accumulator or system","date":"YYYY-MM-DD","selections":[{"match":"match name","pick":"selection","odds":"odds","status":"won/lost/pending"}],"betStatus":"won/lost/pending","notes":"any notes"}`
+RULES:
+1. DATE: Use the date visible on the slip. If no date is visible, use today: ${today}. NEVER guess or invent a date. Format: YYYY-MM-DD.
+2. STATUS (CRITICAL): Default is ALWAYS "pending" unless you see EXPLICIT visual proof:
+   - "won" ONLY IF: green background/text, checkmark ✓, text "trafiony"/"wygrany"/"won"/"wygrana"
+   - "lost" ONLY IF: red background/text, ✗ cross, text "przegrany"/"lost"/"przegrana"
+   - "pending" = anything else, including unclear or ambiguous cases
+3. STAKE: Extract the exact number. Remove currency symbols. Use dot as decimal separator.
+4. ODDS: Total combined odds of the slip (the big number, not individual selection odds).
+5. BOOKMAKER: Name of the bookmaker if visible, else null.
+6. BET TYPE: "single" (1 selection), "accumulator" (2+ selections combined), "system".
+
+Return ONLY valid JSON, no markdown, no backticks, no explanation:
+{"bookmaker":"name or null","stake":"number","odds":"number","betType":"single|accumulator|system","date":"YYYY-MM-DD","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
           }
         ]
       }]
     });
 
     const text = response.choices[0]?.message?.content?.replace(/```json|```/g, '').trim();
-    const parsed = JSON.parse(text);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (parseErr) {
+      console.error('Scan JSON parse error:', text);
+      return res.status(500).json({ error: 'AI zwróciło nieprawidłowy JSON. Spróbuj ponownie.' });
+    }
+
+    // Sanitize: jeśli date jest pusta lub nieprawidłowa, daj today
+    if (!parsed.date || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) {
+      parsed.date = today;
+    }
+    // Sanitize: jeśli betStatus nie jest jednym z dozwolonych, daj pending
+    if (!['won', 'lost', 'pending', 'void'].includes(parsed.betStatus)) {
+      parsed.betStatus = 'pending';
+    }
+    // Sanitize: każda selekcja też
+    if (Array.isArray(parsed.selections)) {
+      parsed.selections = parsed.selections.map(s => ({
+        ...s,
+        status: ['won', 'lost', 'pending'].includes(s.status) ? s.status : 'pending'
+      }));
+    }
+
     res.json(parsed);
   } catch (e) {
     console.error('Scan error:', e);
