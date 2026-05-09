@@ -850,6 +850,7 @@ app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res
     const sessionPayload = {
       mode: 'subscription',
       line_items: [{ price: process.env.STRIPE_PREMIUM_PRICE_ID, quantity: 1 }],
+      allow_promotion_codes: true,
       success_url: `${FRONTEND_URL}?billing=success`,
       cancel_url: `${FRONTEND_URL}?billing=cancel`,
       client_reference_id: String(user.id),
@@ -890,6 +891,7 @@ app.post('/api/billing/create-onetime-checkout-session', authMiddleware, async (
       mode: 'payment',
       payment_method_types: ['card', 'blik'],
       line_items: [{ price: process.env.STRIPE_ONETIME_PRICE_ID, quantity: 1 }],
+      allow_promotion_codes: true,
       success_url: `${FRONTEND_URL}?billing=onetime_success`,
       cancel_url: `${FRONTEND_URL}?billing=cancel`,
       client_reference_id: String(user.id),
