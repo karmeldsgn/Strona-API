@@ -158,6 +158,7 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT UNIQUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT UNIQUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_status TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS premium_until TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_count INTEGER DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_reset DATE DEFAULT CURRENT_DATE;
     ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
@@ -176,6 +177,12 @@ async function initDB() {
     WHERE is_premium = TRUE
       AND COALESCE(discord_premium, FALSE) = FALSE
       AND COALESCE(stripe_premium, FALSE) = FALSE;
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE users
+    SET is_premium = TRUE
+    WHERE COALESCE(premium_until, NOW()) > NOW();
   `).catch(() => {});
 
   console.log('✅ Database initialized');
@@ -340,6 +347,10 @@ function stripeActiveStatus(status) {
   return ['active', 'trialing'].includes(status);
 }
 
+function oneTimePremiumDays() {
+  return Math.max(Number.parseInt(process.env.STRIPE_ONETIME_PREMIUM_DAYS || '30', 10) || 30, 1);
+}
+
 async function syncStripeSubscription({ userId, customerId, subscriptionId, status }) {
   const stripePremium = stripeActiveStatus(status);
   const params = [
@@ -369,9 +380,33 @@ async function syncStripeSubscription({ userId, customerId, subscriptionId, stat
         stripe_subscription_id=COALESCE($2, stripe_subscription_id),
         stripe_subscription_status=COALESCE($3, stripe_subscription_status),
         stripe_premium=$4,
-        is_premium=($4 OR COALESCE(discord_premium, false))
+        is_premium=($4 OR COALESCE(discord_premium, false) OR COALESCE(premium_until, NOW()) > NOW())
     WHERE ${where}
     RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+  `, params);
+  return rows[0] || null;
+}
+
+async function grantOneTimePremium({ userId, customerId, days }) {
+  if (!userId && !customerId) return null;
+  const validDays = Math.max(Number.parseInt(days || oneTimePremiumDays(), 10) || oneTimePremiumDays(), 1);
+  const params = [customerId || null, validDays];
+  let where;
+  if (userId) {
+    params.push(Number(userId));
+    where = `id=$${params.length}`;
+  } else {
+    params.push(customerId);
+    where = `stripe_customer_id=$${params.length}`;
+  }
+
+  const { rows } = await pool.query(`
+    UPDATE users
+    SET stripe_customer_id=COALESCE($1, stripe_customer_id),
+        premium_until=GREATEST(COALESCE(premium_until, NOW()), NOW()) + ($2::int * INTERVAL '1 day'),
+        is_premium=TRUE
+    WHERE ${where}
+    RETURNING id, username, email, avatar, is_premium, language, tax_enabled, premium_until
   `, params);
   return rows[0] || null;
 }
@@ -385,6 +420,13 @@ async function handleStripeEvent(event) {
         customerId: session.customer,
         subscriptionId: session.subscription,
         status: 'active',
+      });
+    }
+    if (session.mode === 'payment') {
+      await grantOneTimePremium({
+        userId: session.client_reference_id || session.metadata?.user_id,
+        customerId: session.customer,
+        days: session.metadata?.premium_days,
       });
     }
     return;
@@ -553,7 +595,10 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   const { rows } = await pool.query(
-    'SELECT id, username, email, language, tax_enabled, is_premium, stripe_customer_id, avatar, daily_count, daily_reset FROM users WHERE id=$1',
+    `SELECT id, username, email, language, tax_enabled,
+            (is_premium OR COALESCE(premium_until, NOW()) > NOW()) AS is_premium,
+            stripe_customer_id, premium_until, avatar, daily_count, daily_reset
+     FROM users WHERE id=$1`,
     [req.user.id]
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
@@ -569,6 +614,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     ...user,
     stripe_customer_id: undefined,
     has_stripe_customer: Boolean(user.stripe_customer_id),
+    premium_until: user.premium_until,
     daily_used:      dailyUsed,
     daily_limit:     user.is_premium ? null : DAILY_FREE_LIMIT,
     daily_remaining: user.is_premium ? null : Math.max(0, DAILY_FREE_LIMIT - dailyUsed)
@@ -823,6 +869,56 @@ app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res
   } catch (err) {
     console.error('Stripe checkout error:', err);
     res.status(500).json({ error: 'Could not create checkout session' });
+  }
+});
+
+app.post('/api/billing/create-onetime-checkout-session', authMiddleware, async (req, res) => {
+  if (!stripe || !process.env.STRIPE_ONETIME_PRICE_ID) {
+    return res.status(503).json({ error: 'Stripe one-time payment is not configured' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, email, username, stripe_customer_id FROM users WHERE id=$1',
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = rows[0];
+    const premiumDays = oneTimePremiumDays();
+
+    const sessionPayload = {
+      mode: 'payment',
+      payment_method_types: ['card', 'blik'],
+      line_items: [{ price: process.env.STRIPE_ONETIME_PRICE_ID, quantity: 1 }],
+      success_url: `${FRONTEND_URL}?billing=onetime_success`,
+      cancel_url: `${FRONTEND_URL}?billing=cancel`,
+      client_reference_id: String(user.id),
+      metadata: {
+        user_id: String(user.id),
+        premium_days: String(premiumDays),
+        purchase_type: 'premium_onetime',
+      },
+      payment_intent_data: {
+        metadata: {
+          user_id: String(user.id),
+          premium_days: String(premiumDays),
+          purchase_type: 'premium_onetime',
+        },
+        description: `Typy z Piwnicy Premium ${premiumDays} dni`,
+      },
+    };
+
+    if (user.stripe_customer_id) {
+      sessionPayload.customer = user.stripe_customer_id;
+    } else if (user.email) {
+      sessionPayload.customer_email = user.email;
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionPayload);
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe one-time checkout error:', err);
+    res.status(500).json({ error: 'Could not create one-time checkout session' });
   }
 });
 
