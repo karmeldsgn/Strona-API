@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const path = require('path');
+const fs = require('fs');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -10,9 +11,21 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const OpenAI = require('openai');
 const axios = require('axios');
+const Stripe = require('stripe');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+const DAILY_FREE_LIMIT = Number.parseInt(process.env.DAILY_FREE_LIMIT || '2', 10) || 2;
+const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
+const missingRequiredEnv = ['DATABASE_URL', 'JWT_SECRET'].filter(key => !process.env[key]);
+if (missingRequiredEnv.length) {
+  console.error(`Missing required environment variables: ${missingRequiredEnv.join(', ')}`);
+  process.exit(1);
+}
+
+app.set('trust proxy', 1);
 
 // ─── DB ───────────────────────────────────────────────────────────────────────
 const pool = new Pool({
@@ -21,22 +34,29 @@ const pool = new Pool({
 });
 
 // ─── OPENAI ───────────────────────────────────────────────────────────────────
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+let openaiClient = null;
+function getOpenAIClient() {
+  if (!process.env.OPENAI_API_KEY) return null;
+  if (!openaiClient) openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+  return openaiClient;
+}
 
 // ─── MIDDLEWARE ───────────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+const allowedOrigins = new Set([
+  FRONTEND_URL,
+  'https://www.typyzpiwnicy.pl',
+  'https://typyzpiwnicy.pl',
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  ...(process.env.CORS_ORIGINS || '').split(',').map(origin => origin.trim()).filter(Boolean)
+]);
 app.use(cors({
   origin: function(origin, callback) {
-    const allowed = [
-      'https://www.typyzpiwnicy.pl',
-      'https://typyzpiwnicy.pl',
-      'http://localhost:3000',
-      'http://localhost:3001',
-      'http://localhost:5500',
-      'http://127.0.0.1:5500'
-    ];
     // Pozwala na zapytania bez origin (np. mobilki) lub te z listy allowed
-    if (!origin || allowed.includes(origin)) {
+    if (!origin || allowedOrigins.has(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Błąd CORS: Ten adres nie ma uprawnień!'));
@@ -44,6 +64,33 @@ app.use(cors({
   },
   credentials: true,
 }));
+
+app.post('/api/billing/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) {
+    return res.status(503).send('Stripe webhook is not configured');
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers['stripe-signature'],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Stripe webhook signature error:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    await handleStripeEvent(event);
+    res.json({ received: true });
+  } catch (err) {
+    console.error('Stripe webhook handler error:', err);
+    res.status(500).send('Webhook handler failed');
+  }
+});
+
 app.use(express.json({ limit: '10mb' }));
 
 const upload = multer({
@@ -106,6 +153,11 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT UNIQUE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT UNIQUE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_subscription_status TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_count INTEGER DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_reset DATE DEFAULT CURRENT_DATE;
     ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
@@ -116,6 +168,14 @@ async function initDB() {
   await pool.query(`
     ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS facebook_id TEXT UNIQUE;
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE users
+    SET discord_premium = TRUE
+    WHERE is_premium = TRUE
+      AND COALESCE(discord_premium, FALSE) = FALSE
+      AND COALESCE(stripe_premium, FALSE) = FALSE;
   `).catch(() => {});
 
   console.log('✅ Database initialized');
@@ -130,6 +190,225 @@ function authMiddleware(req, res, next) {
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+const VALID_STATUSES = new Set(['pending', 'won', 'lost', 'void']);
+const VALID_BET_TYPES = new Set(['single', 'accumulator', 'system']);
+const PROVIDER_COLUMNS = {
+  discord: 'discord_id',
+  google: 'google_id',
+  facebook: 'facebook_id',
+};
+
+function todayISO() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function normalizeEmail(email) {
+  return email ? String(email).trim().toLowerCase() : null;
+}
+
+function normalizeText(value, maxLength) {
+  if (value === undefined || value === null) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  return text.slice(0, maxLength);
+}
+
+function parsePositiveNumber(value, min = 0) {
+  const normalized = typeof value === 'string' ? value.replace(',', '.') : value;
+  const number = Number(normalized);
+  return Number.isFinite(number) && number > min ? number : null;
+}
+
+function isValidDateString(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function safeUsername(value, fallback = 'user') {
+  const base = String(value || fallback)
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 45);
+  return base || fallback;
+}
+
+async function getAvailableUsername(base) {
+  const cleanBase = safeUsername(base);
+  for (let i = 0; i < 100; i++) {
+    const suffix = i === 0 ? '' : `_${i}`;
+    const candidate = `${cleanBase.slice(0, 50 - suffix.length)}${suffix}`;
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE LOWER(username)=LOWER($1) LIMIT 1',
+      [candidate]
+    );
+    if (!rows.length) return candidate;
+  }
+  return `${safeUsername(cleanBase, 'user').slice(0, 32)}_${Date.now().toString(36)}`;
+}
+
+function publicUser(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    avatar: row.avatar,
+    is_premium: row.is_premium,
+    has_stripe_customer: Boolean(row.stripe_customer_id),
+    language: row.language,
+    tax_enabled: row.tax_enabled,
+  };
+}
+
+function signUserToken(user) {
+  return jwt.sign(
+    { id: user.id, username: user.username },
+    process.env.JWT_SECRET,
+    { expiresIn: '30d' }
+  );
+}
+
+async function updateOAuthUser(id, providerColumn, providerId, email, avatar, isPremium) {
+  let safeEmail = email;
+  if (safeEmail) {
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email)=LOWER($1) AND id<>$2 LIMIT 1',
+      [safeEmail, id]
+    );
+    if (rows.length) safeEmail = null;
+  }
+
+  const params = [providerId, safeEmail, avatar, id];
+  let premiumSql = '';
+  if (typeof isPremium === 'boolean') {
+    params.push(isPremium);
+    premiumSql = `, discord_premium=$${params.length}, is_premium=($${params.length} OR COALESCE(stripe_premium, false))`;
+  }
+
+  const { rows } = await pool.query(`
+    UPDATE users
+    SET ${providerColumn}=$1,
+        email=COALESCE($2, email),
+        avatar=COALESCE($3, avatar)
+        ${premiumSql}
+    WHERE id=$4
+    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+  `, params);
+  return rows[0];
+}
+
+async function upsertOAuthUser({ provider, providerId, username, email, avatar, isPremium }) {
+  const providerColumn = PROVIDER_COLUMNS[provider];
+  if (!providerColumn || !providerId) throw new Error('Invalid OAuth provider');
+
+  const cleanEmail = normalizeEmail(email);
+  const { rows: providerRows } = await pool.query(
+    `SELECT id FROM users WHERE ${providerColumn}=$1 LIMIT 1`,
+    [providerId]
+  );
+  if (providerRows.length) {
+    return updateOAuthUser(providerRows[0].id, providerColumn, providerId, cleanEmail, avatar, isPremium);
+  }
+
+  if (cleanEmail) {
+    const { rows: emailRows } = await pool.query(
+      'SELECT id FROM users WHERE LOWER(email)=LOWER($1) LIMIT 1',
+      [cleanEmail]
+    );
+    if (emailRows.length) {
+      return updateOAuthUser(emailRows[0].id, providerColumn, providerId, cleanEmail, avatar, isPremium);
+    }
+  }
+
+  const finalUsername = await getAvailableUsername(username || `${provider}_${providerId}`);
+  const discordPremium = provider === 'discord' ? Boolean(isPremium) : false;
+  const { rows } = await pool.query(`
+    INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium)
+    VALUES ($1, $2, $3, $4, '', $5, $6)
+    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+  `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
+  return rows[0];
+}
+
+function stripeActiveStatus(status) {
+  return ['active', 'trialing'].includes(status);
+}
+
+async function syncStripeSubscription({ userId, customerId, subscriptionId, status }) {
+  const stripePremium = stripeActiveStatus(status);
+  const params = [
+    customerId || null,
+    subscriptionId || null,
+    status || null,
+    stripePremium,
+  ];
+
+  let where = '';
+  if (userId) {
+    params.push(Number(userId));
+    where = `id=$${params.length}`;
+  } else if (customerId) {
+    params.push(customerId);
+    where = `stripe_customer_id=$${params.length}`;
+  } else if (subscriptionId) {
+    params.push(subscriptionId);
+    where = `stripe_subscription_id=$${params.length}`;
+  } else {
+    return null;
+  }
+
+  const { rows } = await pool.query(`
+    UPDATE users
+    SET stripe_customer_id=COALESCE($1, stripe_customer_id),
+        stripe_subscription_id=COALESCE($2, stripe_subscription_id),
+        stripe_subscription_status=COALESCE($3, stripe_subscription_status),
+        stripe_premium=$4,
+        is_premium=($4 OR COALESCE(discord_premium, false))
+    WHERE ${where}
+    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+  `, params);
+  return rows[0] || null;
+}
+
+async function handleStripeEvent(event) {
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    if (session.mode === 'subscription') {
+      await syncStripeSubscription({
+        userId: session.client_reference_id || session.metadata?.user_id,
+        customerId: session.customer,
+        subscriptionId: session.subscription,
+        status: 'active',
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'customer.subscription.created' || event.type === 'customer.subscription.updated') {
+    const subscription = event.data.object;
+    await syncStripeSubscription({
+      userId: subscription.metadata?.user_id,
+      customerId: subscription.customer,
+      subscriptionId: subscription.id,
+      status: subscription.status,
+    });
+    return;
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const subscription = event.data.object;
+    await syncStripeSubscription({
+      userId: subscription.metadata?.user_id,
+      customerId: subscription.customer,
+      subscriptionId: subscription.id,
+      status: subscription.status || 'canceled',
+    });
   }
 }
 
@@ -171,7 +450,7 @@ async function checkDailyLimit(req, res, next) {
     if (user.is_premium) return next();
 
     // Sprawdź czy dziś trzeba zresetować licznik
-    const today = new Date().toISOString().split('T')[0];
+    const today = todayISO();
     const lastReset = user.daily_reset
       ? new Date(user.daily_reset).toISOString().split('T')[0]
       : '1970-01-01';
@@ -185,22 +464,18 @@ async function checkDailyLimit(req, res, next) {
       currentCount = 0;
     }
 
-    if (currentCount >= 2) {
+    if (currentCount >= DAILY_FREE_LIMIT) {
       return res.status(429).json({
         error: 'Dzienny limit kuponów wyczerpany',
-        message: 'Darmowe konto pozwala na 2 kupony dziennie. Zdobądź rangę Premium na Discordzie!',
-        limit: 2,
+        message: `Darmowe konto pozwala na ${DAILY_FREE_LIMIT} kupony dziennie. Zdobądź rangę Premium na Discordzie!`,
+        limit: DAILY_FREE_LIMIT,
         used: currentCount,
         is_premium: false,
         reset_at: new Date(new Date().setHours(24, 0, 0, 0)).toISOString()
       });
     }
 
-    // Inkrementuj licznik
-    await pool.query(
-      'UPDATE users SET daily_count=daily_count+1, daily_reset=$1 WHERE id=$2',
-      [today, req.user.id]
-    );
+    req.dailyLimit = { shouldIncrement: true, today };
     next();
   } catch (err) {
     console.error('checkDailyLimit error:', err);
@@ -211,17 +486,26 @@ async function checkDailyLimit(req, res, next) {
 // ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 app.post('/api/auth/register', authLimiter, async (req, res) => {
   const { username, email, password, language = 'pl' } = req.body;
-  if (!username || !email || !password) return res.status(400).json({ error: 'Missing fields' });
+  const cleanUsername = normalizeText(username, 50);
+  const cleanEmail = normalizeEmail(email);
+  if (!cleanUsername || !cleanEmail || !password) return res.status(400).json({ error: 'Missing fields' });
   if (password.length < 6) return res.status(400).json({ error: 'Password too short' });
-  if (username.length < 3 || username.length > 50) return res.status(400).json({ error: 'Invalid username length' });
+  if (cleanUsername.length < 3 || cleanUsername.length > 50) return res.status(400).json({ error: 'Invalid username length' });
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) return res.status(400).json({ error: 'Invalid email' });
 
   try {
+    const existing = await pool.query(
+      'SELECT id FROM users WHERE LOWER(username)=LOWER($1) OR LOWER(email)=LOWER($2) LIMIT 1',
+      [cleanUsername, cleanEmail]
+    );
+    if (existing.rows.length) return res.status(409).json({ error: 'Username or email already taken' });
+
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      'INSERT INTO users (username, email, password_hash, language) VALUES ($1, $2, $3, $4) RETURNING id, username, email, language',
-      [username.trim(), email.toLowerCase().trim(), hash, language]
+      'INSERT INTO users (username, email, password_hash, language) VALUES ($1, $2, $3, $4) RETURNING id, username, email, language, tax_enabled, is_premium, avatar',
+      [cleanUsername, cleanEmail, hash, language === 'en' ? 'en' : 'pl']
     );
-    const token = jwt.sign({ id: rows[0].id, username: rows[0].username }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    const token = signUserToken(rows[0]);
     res.json({ token, user: rows[0] });
   } catch (e) {
     if (e.code === '23505') {
@@ -239,7 +523,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM users WHERE email=$1 OR username=$1',
+      'SELECT * FROM users WHERE LOWER(email)=LOWER($1) OR LOWER(username)=LOWER($1)',
       [login.toLowerCase().trim()]
     );
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
@@ -247,7 +531,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign({ id: rows[0].id, username: rows[0].username }, process.env.JWT_SECRET, { expiresIn: '30d' });
+    const token = signUserToken(rows[0]);
     res.json({
       token,
       user: {
@@ -257,6 +541,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         language: rows[0].language,
         tax_enabled: rows[0].tax_enabled,
         is_premium: rows[0].is_premium,
+        has_stripe_customer: Boolean(rows[0].stripe_customer_id),
         avatar: rows[0].avatar
       }
     });
@@ -268,13 +553,13 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   const { rows } = await pool.query(
-    'SELECT id, username, email, language, tax_enabled, is_premium, avatar, daily_count, daily_reset FROM users WHERE id=$1',
+    'SELECT id, username, email, language, tax_enabled, is_premium, stripe_customer_id, avatar, daily_count, daily_reset FROM users WHERE id=$1',
     [req.user.id]
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
 
   const user = rows[0];
-  const today = new Date().toISOString().split('T')[0];
+  const today = todayISO();
   const lastReset = user.daily_reset
     ? new Date(user.daily_reset).toISOString().split('T')[0]
     : '1970-01-01';
@@ -282,15 +567,18 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
 
   res.json({
     ...user,
+    stripe_customer_id: undefined,
+    has_stripe_customer: Boolean(user.stripe_customer_id),
     daily_used:      dailyUsed,
-    daily_limit:     user.is_premium ? null : 2,
-    daily_remaining: user.is_premium ? null : Math.max(0, 2 - dailyUsed)
+    daily_limit:     user.is_premium ? null : DAILY_FREE_LIMIT,
+    daily_remaining: user.is_premium ? null : Math.max(0, DAILY_FREE_LIMIT - dailyUsed)
   });
 });
 
 app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
   const { language, tax_enabled } = req.body;
-  await pool.query('UPDATE users SET language=$1, tax_enabled=$2 WHERE id=$3', [language, tax_enabled, req.user.id]);
+  const cleanLanguage = language === 'en' ? 'en' : 'pl';
+  await pool.query('UPDATE users SET language=$1, tax_enabled=$2 WHERE id=$3', [cleanLanguage, Boolean(tax_enabled), req.user.id]);
   res.json({ ok: true });
 });
 
@@ -309,7 +597,7 @@ app.get('/api/auth/discord', (req, res) => {
 // KROK 2: Callback po autoryzacji
 app.get('/api/auth/discord/callback', async (req, res) => {
   const { code, error } = req.query;
-  const FRONTEND = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+  const FRONTEND = FRONTEND_URL;
 
   if (error || !code) {
     return res.redirect(`${FRONTEND}?auth_error=cancelled`);
@@ -345,36 +633,20 @@ app.get('/api/auth/discord/callback', async (req, res) => {
       : `https://cdn.discordapp.com/embed/avatars/${Number(BigInt(d.id) % 5n)}.png`;
 
     // 5. Upsert użytkownika
-    const { rows } = await pool.query(`
-      INSERT INTO users (discord_id, username, email, avatar, is_premium, password_hash)
-      VALUES ($1, $2, $3, $4, $5, '')
-      ON CONFLICT (discord_id) DO UPDATE SET
-        username   = EXCLUDED.username,
-        email      = COALESCE(EXCLUDED.email, users.email),
-        avatar     = EXCLUDED.avatar,
-        is_premium = EXCLUDED.is_premium
-      RETURNING id, username, email, avatar, is_premium, language, tax_enabled
-    `, [d.id, d.username, d.email || null, avatar, isPremium]);
-
-    const user = rows[0];
+    const user = await upsertOAuthUser({
+      provider: 'discord',
+      providerId: d.id,
+      username: d.username,
+      email: d.email || null,
+      avatar,
+      isPremium,
+    });
 
     // 6. Wygeneruj JWT (używamy tego samego formatu co reszta: { id, username })
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
+    const token = signUserToken(user);
 
     // 7. Przekieruj na frontend z tokenem
-    const userParam = encodeURIComponent(JSON.stringify({
-      id:         user.id,
-      username:   user.username,
-      email:      user.email,
-      avatar:     user.avatar,
-      is_premium: user.is_premium,
-      language:   user.language,
-      tax_enabled: user.tax_enabled
-    }));
+    const userParam = encodeURIComponent(JSON.stringify(publicUser(user)));
 
     res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
 
@@ -401,7 +673,7 @@ app.get('/api/auth/google', (req, res) => {
 // KROK 2: Callback Google
 app.get('/api/auth/google/callback', async (req, res) => {
   const { code, error } = req.query;
-  const FRONTEND = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+  const FRONTEND = FRONTEND_URL;
 
   if (error || !code) {
     return res.redirect(`${FRONTEND}?auth_error=google_cancelled`);
@@ -428,36 +700,20 @@ app.get('/api/auth/google/callback', async (req, res) => {
     });
     const g = userRes.data; // { sub, name, email, picture }
 
-    const username = (g.name || g.email.split('@')[0]).replace(/\s+/g, '_').substring(0, 50);
+    const username = g.name || (g.email ? g.email.split('@')[0] : `google_${g.sub}`);
     const avatar   = g.picture || null;
 
-    // 3. Upsert użytkownika po google_id
-    const { rows } = await pool.query(`
-      INSERT INTO users (google_id, username, email, avatar, password_hash)
-      VALUES ($1, $2, $3, $4, '')
-      ON CONFLICT (google_id) DO UPDATE SET
-        username = EXCLUDED.username,
-        email    = COALESCE(EXCLUDED.email, users.email),
-        avatar   = COALESCE(EXCLUDED.avatar, users.avatar)
-      RETURNING id, username, email, avatar, is_premium, language, tax_enabled
-    `, [g.sub, username, g.email || null, avatar]);
+    // 3. Upsert użytkownika po google_id albo emailu
+    const user = await upsertOAuthUser({
+      provider: 'google',
+      providerId: g.sub,
+      username,
+      email: g.email || null,
+      avatar,
+    });
+    const token = signUserToken(user);
 
-    const user = rows[0];
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    const userParam = encodeURIComponent(JSON.stringify({
-      id:          user.id,
-      username:    user.username,
-      email:       user.email,
-      avatar:      user.avatar,
-      is_premium:  user.is_premium,
-      language:    user.language,
-      tax_enabled: user.tax_enabled,
-    }));
+    const userParam = encodeURIComponent(JSON.stringify(publicUser(user)));
 
     res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
 
@@ -482,7 +738,7 @@ app.get('/api/auth/facebook', (req, res) => {
 // KROK 2: Callback Facebook
 app.get('/api/auth/facebook/callback', async (req, res) => {
   const { code, error } = req.query;
-  const FRONTEND = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
+  const FRONTEND = FRONTEND_URL;
 
   if (error || !code) {
     return res.redirect(`${FRONTEND}?auth_error=facebook_cancelled`);
@@ -506,36 +762,20 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
     });
     const f = userRes.data; // { id, name, email, picture }
 
-    const username = (f.name || `fb_${f.id}`).replace(/\s+/g, '_').substring(0, 50);
+    const username = f.name || `fb_${f.id}`;
     const avatar   = f.picture?.data?.url || null;
 
-    // 3. Upsert użytkownika po facebook_id
-    const { rows } = await pool.query(`
-      INSERT INTO users (facebook_id, username, email, avatar, password_hash)
-      VALUES ($1, $2, $3, $4, '')
-      ON CONFLICT (facebook_id) DO UPDATE SET
-        username = EXCLUDED.username,
-        email    = COALESCE(EXCLUDED.email, users.email),
-        avatar   = COALESCE(EXCLUDED.avatar, users.avatar)
-      RETURNING id, username, email, avatar, is_premium, language, tax_enabled
-    `, [f.id, username, f.email || null, avatar]);
+    // 3. Upsert użytkownika po facebook_id albo emailu
+    const user = await upsertOAuthUser({
+      provider: 'facebook',
+      providerId: f.id,
+      username,
+      email: f.email || null,
+      avatar,
+    });
+    const token = signUserToken(user);
 
-    const user = rows[0];
-    const token = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '30d' }
-    );
-
-    const userParam = encodeURIComponent(JSON.stringify({
-      id:          user.id,
-      username:    user.username,
-      email:       user.email,
-      avatar:      user.avatar,
-      is_premium:  user.is_premium,
-      language:    user.language,
-      tax_enabled: user.tax_enabled,
-    }));
+    const userParam = encodeURIComponent(JSON.stringify(publicUser(user)));
 
     res.redirect(`${FRONTEND}?token=${token}&user=${userParam}`);
 
@@ -547,30 +787,90 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
 
 // ─── BETS ROUTES ──────────────────────────────────────────────────────────────
 
+// ─── STRIPE BILLING ───────────────────────────────────────────────────────────
+app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res) => {
+  if (!stripe || !process.env.STRIPE_PREMIUM_PRICE_ID) {
+    return res.status(503).json({ error: 'Stripe is not configured' });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, email, username, stripe_customer_id FROM users WHERE id=$1',
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    const user = rows[0];
+
+    const sessionPayload = {
+      mode: 'subscription',
+      line_items: [{ price: process.env.STRIPE_PREMIUM_PRICE_ID, quantity: 1 }],
+      success_url: `${FRONTEND_URL}?billing=success`,
+      cancel_url: `${FRONTEND_URL}?billing=cancel`,
+      client_reference_id: String(user.id),
+      metadata: { user_id: String(user.id) },
+      subscription_data: { metadata: { user_id: String(user.id) } },
+      allow_promotion_codes: true,
+    };
+
+    if (user.stripe_customer_id) {
+      sessionPayload.customer = user.stripe_customer_id;
+    } else if (user.email) {
+      sessionPayload.customer_email = user.email;
+    }
+
+    const session = await stripe.checkout.sessions.create(sessionPayload);
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe checkout error:', err);
+    res.status(500).json({ error: 'Could not create checkout session' });
+  }
+});
+
+app.post('/api/billing/create-portal-session', authMiddleware, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured' });
+
+  try {
+    const { rows } = await pool.query(
+      'SELECT stripe_customer_id FROM users WHERE id=$1',
+      [req.user.id]
+    );
+    const customerId = rows[0]?.stripe_customer_id;
+    if (!customerId) return res.status(400).json({ error: 'No Stripe customer found' });
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: FRONTEND_URL,
+    });
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Stripe portal error:', err);
+    res.status(500).json({ error: 'Could not create billing portal session' });
+  }
+});
+
 // GET /api/bets/daily-limit — info o dziennym limicie kuponów
 app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    // Get user premium status
     const { rows: userRows } = await pool.query(
-      'SELECT is_premium FROM users WHERE id=$1', [userId]
+      'SELECT is_premium, daily_count, daily_reset FROM users WHERE id=$1', [userId]
     );
-    const isPremium = userRows[0]?.is_premium || false;
-    const dailyLimit = isPremium ? null : 2;
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Count today's bets
-    const { rows: countRows } = await pool.query(
-      `SELECT COUNT(*) as count FROM bets
-       WHERE user_id=$1 AND date=CURRENT_DATE`,
-      [userId]
-    );
-    const usedToday = parseInt(countRows[0]?.count || 0);
+    const isPremium = user.is_premium || false;
+    const dailyLimit = isPremium ? null : DAILY_FREE_LIMIT;
+    const today = todayISO();
+    const lastReset = user.daily_reset
+      ? new Date(user.daily_reset).toISOString().split('T')[0]
+      : '1970-01-01';
+    const usedToday = lastReset < today ? 0 : Number(user.daily_count || 0);
 
     res.json({
       used_today: usedToday,
-      daily_limit: dailyLimit ?? 2,
+      daily_limit: dailyLimit ?? DAILY_FREE_LIMIT,
       is_premium: isPremium,
-      can_add: isPremium || usedToday < 2
+      can_add: isPremium || usedToday < DAILY_FREE_LIMIT
     });
   } catch (err) {
     console.error('Daily limit error:', err.message);
@@ -580,11 +880,17 @@ app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
 
 app.get('/api/bets', authMiddleware, apiLimiter, async (req, res) => {
   const { status, limit = 200, offset = 0 } = req.query;
+  if (status && status !== 'all' && !VALID_STATUSES.has(status)) {
+    return res.status(400).json({ error: 'Invalid status' });
+  }
+
+  const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 200, 1), 500);
+  const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
   let q = 'SELECT * FROM bets WHERE user_id=$1';
   const params = [req.user.id];
   if (status && status !== 'all') { q += ` AND status=$${params.length + 1}`; params.push(status); }
   q += ` ORDER BY date DESC, created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
-  params.push(parseInt(limit), parseInt(offset));
+  params.push(safeLimit, safeOffset);
   const { rows } = await pool.query(q, params);
   res.json(rows);
 });
@@ -592,24 +898,110 @@ app.get('/api/bets', authMiddleware, apiLimiter, async (req, res) => {
 // POST /api/bets — z limitem dziennym dla zwykłych userów
 app.post('/api/bets', authMiddleware, apiLimiter, checkDailyLimit, async (req, res) => {
   const { date, bookmaker, category, stake, odds, bet_type, notes, selections, status } = req.body;
-  if (!date || !stake || !odds) return res.status(400).json({ error: 'Missing required fields' });
+  const parsedStake = parsePositiveNumber(stake);
+  const parsedOdds = parsePositiveNumber(odds, 1);
+  const cleanStatus = status || 'pending';
+  const cleanBetType = bet_type || 'single';
 
-  const { rows } = await pool.query(
-    `INSERT INTO bets (user_id, date, bookmaker, category, stake, odds, bet_type, notes, selections, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-    [req.user.id, date, bookmaker || null, category || null, parseFloat(stake), parseFloat(odds),
-     bet_type || 'single', notes || null, JSON.stringify(selections || []), status || 'pending']
-  );
-  res.json(rows[0]);
+  if (!date || !parsedStake || !parsedOdds) return res.status(400).json({ error: 'Missing required fields' });
+  if (!isValidDateString(date)) return res.status(400).json({ error: 'Invalid date' });
+  if (!VALID_STATUSES.has(cleanStatus)) return res.status(400).json({ error: 'Invalid status' });
+  if (!VALID_BET_TYPES.has(cleanBetType)) return res.status(400).json({ error: 'Invalid bet type' });
+  if (selections !== undefined && !Array.isArray(selections)) return res.status(400).json({ error: 'Invalid selections' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `INSERT INTO bets (user_id, date, bookmaker, category, stake, odds, bet_type, notes, selections, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [
+        req.user.id,
+        date,
+        normalizeText(bookmaker, 100),
+        normalizeText(category, 50),
+        parsedStake,
+        parsedOdds,
+        cleanBetType,
+        normalizeText(notes, 5000),
+        JSON.stringify(selections || []),
+        cleanStatus
+      ]
+    );
+    if (req.dailyLimit?.shouldIncrement) {
+      await client.query(
+        'UPDATE users SET daily_count=daily_count+1, daily_reset=$1 WHERE id=$2',
+        [req.dailyLimit.today, req.user.id]
+      );
+    }
+    await client.query('COMMIT');
+    res.json(rows[0]);
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('Create bet error:', err);
+    res.status(500).json({ error: 'Server error' });
+  } finally {
+    client.release();
+  }
 });
 
 app.patch('/api/bets/:id', authMiddleware, apiLimiter, async (req, res) => {
-  const { status, notes, selections } = req.body;
+  const { date, bookmaker, category, stake, odds, bet_type, status, notes, selections } = req.body;
+  const parsedStake = stake !== undefined ? parsePositiveNumber(stake) : undefined;
+  const parsedOdds = odds !== undefined ? parsePositiveNumber(odds, 1) : undefined;
+
+  if (date !== undefined && !isValidDateString(date)) return res.status(400).json({ error: 'Invalid date' });
+  if (stake !== undefined && !parsedStake) return res.status(400).json({ error: 'Invalid stake' });
+  if (odds !== undefined && !parsedOdds) return res.status(400).json({ error: 'Invalid odds' });
+  if (bet_type !== undefined && !VALID_BET_TYPES.has(bet_type)) return res.status(400).json({ error: 'Invalid bet type' });
+  if (status !== undefined && !VALID_STATUSES.has(status)) return res.status(400).json({ error: 'Invalid status' });
+  if (selections !== undefined && !Array.isArray(selections)) return res.status(400).json({ error: 'Invalid selections' });
+
+  const updates = [];
+  const params = [];
+  if (date !== undefined) {
+    params.push(date);
+    updates.push(`date=$${params.length}`);
+  }
+  if (bookmaker !== undefined) {
+    params.push(normalizeText(bookmaker, 100));
+    updates.push(`bookmaker=$${params.length}`);
+  }
+  if (category !== undefined) {
+    params.push(normalizeText(category, 50));
+    updates.push(`category=$${params.length}`);
+  }
+  if (stake !== undefined) {
+    params.push(parsedStake);
+    updates.push(`stake=$${params.length}`);
+  }
+  if (odds !== undefined) {
+    params.push(parsedOdds);
+    updates.push(`odds=$${params.length}`);
+  }
+  if (bet_type !== undefined) {
+    params.push(bet_type);
+    updates.push(`bet_type=$${params.length}`);
+  }
+  if (status !== undefined) {
+    params.push(status);
+    updates.push(`status=$${params.length}`);
+  }
+  if (notes !== undefined) {
+    params.push(normalizeText(notes, 5000));
+    updates.push(`notes=$${params.length}`);
+  }
+  if (selections !== undefined) {
+    params.push(JSON.stringify(selections));
+    updates.push(`selections=$${params.length}`);
+  }
+  if (!updates.length) return res.status(400).json({ error: 'No changes provided' });
+
+  params.push(req.params.id, req.user.id);
   const { rows } = await pool.query(
-    `UPDATE bets SET status=COALESCE($1,status), notes=COALESCE($2,notes),
-     selections=COALESCE($3,selections), updated_at=NOW()
-     WHERE id=$4 AND user_id=$5 RETURNING *`,
-    [status, notes, selections ? JSON.stringify(selections) : null, req.params.id, req.user.id]
+    `UPDATE bets SET ${updates.join(', ')}, updated_at=NOW()
+     WHERE id=$${params.length - 1} AND user_id=$${params.length} RETURNING *`,
+    params
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
   res.json(rows[0]);
@@ -641,10 +1033,11 @@ app.get('/api/bets/stats', authMiddleware, async (req, res) => {
 // ─── AI SCAN ROUTE ────────────────────────────────────────────────────────────
 app.post('/api/scan', authMiddleware, scanLimiter, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image provided' });
-  if (!process.env.OPENAI_API_KEY) return res.status(503).json({ error: 'AI scanning not configured' });
+  const openai = getOpenAIClient();
+  if (!openai) return res.status(503).json({ error: 'AI scanning not configured' });
 
   // Klient może przesłać aktualną datę — jeśli nie, bierzemy serwerową
-  const today = req.body?.today || new Date().toISOString().split('T')[0];
+  const today = req.body?.today || todayISO();
 
   try {
     const b64 = req.file.buffer.toString('base64');
@@ -720,11 +1113,15 @@ app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // ─── FRONTEND STATIC ─────────────────────────────────────────────────────────
 // Serwuje gotowy frontend z folderu public, żeby można było odpalić całość jako jedną apkę.
-app.use(express.static(path.join(__dirname, 'public')));
-app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/')) return next();
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+const publicDir = path.join(__dirname, 'public');
+const publicIndex = path.join(publicDir, 'index.html');
+if (fs.existsSync(publicIndex)) {
+  app.use(express.static(publicDir));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    res.sendFile(publicIndex);
+  });
+}
 
 // ─── START ────────────────────────────────────────────────────────────────────
 initDB().then(() => {
