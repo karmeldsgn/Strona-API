@@ -16,7 +16,7 @@ const Stripe = require('stripe');
 const app = express();
 const PORT = process.env.PORT || 3001;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.typyzpiwnicy.pl';
-const DAILY_FREE_LIMIT = Number.parseInt(process.env.DAILY_FREE_LIMIT || '2', 10) || 2;
+const TRIAL_DAYS = Math.max(Number.parseInt(process.env.TRIAL_DAYS || '3', 10) || 3, 1);
 const stripe = process.env.STRIPE_SECRET_KEY ? Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 const missingRequiredEnv = ['DATABASE_URL', 'JWT_SECRET'].filter(key => !process.env[key]);
@@ -121,6 +121,7 @@ async function initDB() {
       discord_name TEXT,
       avatar TEXT,
       is_premium BOOLEAN DEFAULT FALSE,
+      trial_started_at TIMESTAMP DEFAULT NOW(),
       daily_count INTEGER DEFAULT 0,
       daily_reset DATE DEFAULT CURRENT_DATE,
       created_at TIMESTAMP DEFAULT NOW()
@@ -153,6 +154,7 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP DEFAULT NOW();
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_premium BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT UNIQUE;
@@ -176,7 +178,14 @@ async function initDB() {
     SET discord_premium = TRUE
     WHERE is_premium = TRUE
       AND COALESCE(discord_premium, FALSE) = FALSE
-      AND COALESCE(stripe_premium, FALSE) = FALSE;
+      AND COALESCE(stripe_premium, FALSE) = FALSE
+      AND premium_until IS NULL;
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE users
+    SET trial_started_at = NOW()
+    WHERE trial_started_at IS NULL;
   `).catch(() => {});
 
   await pool.query(`
@@ -268,9 +277,26 @@ function publicUser(row) {
     avatar: row.avatar,
     is_premium: row.is_premium,
     has_stripe_customer: Boolean(row.stripe_customer_id),
+    trial_active: Boolean(row.trial_active),
+    trial_ends_at: row.trial_ends_at,
     language: row.language,
     tax_enabled: row.tax_enabled,
   };
+}
+
+function effectivePremiumSql(alias = 'users') {
+  const p = alias ? `${alias}.` : '';
+  return `(COALESCE(${p}discord_premium, false) OR COALESCE(${p}stripe_premium, false) OR COALESCE(${p}premium_until, NOW()) > NOW())`;
+}
+
+function trialActiveSql(alias = 'users') {
+  const p = alias ? `${alias}.` : '';
+  return `(COALESCE(${p}trial_started_at, ${p}created_at, NOW()) + (${TRIAL_DAYS} * INTERVAL '1 day') > NOW())`;
+}
+
+function trialEndsSql(alias = 'users') {
+  const p = alias ? `${alias}.` : '';
+  return `(COALESCE(${p}trial_started_at, ${p}created_at, NOW()) + (${TRIAL_DAYS} * INTERVAL '1 day'))`;
 }
 
 function signUserToken(user) {
@@ -305,7 +331,7 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
         avatar=COALESCE($3, avatar)
         ${premiumSql}
     WHERE id=$4
-    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, language, tax_enabled
   `, params);
   return rows[0];
 }
@@ -338,7 +364,7 @@ async function upsertOAuthUser({ provider, providerId, username, email, avatar, 
   const { rows } = await pool.query(`
     INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium)
     VALUES ($1, $2, $3, $4, '', $5, $6)
-    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, language, tax_enabled
   `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
   return rows[0];
 }
@@ -478,49 +504,30 @@ async function checkPremiumRole(discordUserId) {
   }
 }
 
-// ─── MIDDLEWARE: limit 2 kuponów dziennie dla zwykłych userów ─────────────────
-async function checkDailyLimit(req, res, next) {
+// ─── MIDDLEWARE: trial/Premium access for adding slips ───────────────────────
+async function checkBetAccess(req, res, next) {
   try {
     const { rows } = await pool.query(
-      'SELECT is_premium, daily_count, daily_reset FROM users WHERE id=$1',
+      `SELECT ${effectivePremiumSql('users')} AS is_premium,
+              ${trialActiveSql('users')} AS trial_active,
+              ${trialEndsSql('users')} AS trial_ends_at
+       FROM users WHERE id=$1`,
       [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'User not found' });
     const user = rows[0];
 
-    // Premium → bez limitu
-    if (user.is_premium) return next();
+    if (user.is_premium || user.trial_active) return next();
 
-    // Sprawdź czy dziś trzeba zresetować licznik
-    const today = todayISO();
-    const lastReset = user.daily_reset
-      ? new Date(user.daily_reset).toISOString().split('T')[0]
-      : '1970-01-01';
-
-    let currentCount = user.daily_count || 0;
-    if (lastReset < today) {
-      await pool.query(
-        'UPDATE users SET daily_count=0, daily_reset=$1 WHERE id=$2',
-        [today, req.user.id]
-      );
-      currentCount = 0;
-    }
-
-    if (currentCount >= DAILY_FREE_LIMIT) {
-      return res.status(429).json({
-        error: 'Dzienny limit kuponów wyczerpany',
-        message: `Darmowe konto pozwala na ${DAILY_FREE_LIMIT} kupony dziennie. Zdobądź rangę Premium na Discordzie!`,
-        limit: DAILY_FREE_LIMIT,
-        used: currentCount,
-        is_premium: false,
-        reset_at: new Date(new Date().setHours(24, 0, 0, 0)).toISOString()
-      });
-    }
-
-    req.dailyLimit = { shouldIncrement: true, today };
-    next();
+    return res.status(402).json({
+      error: 'Trial expired',
+      message: 'Twój 3-dniowy okres próbny minął. Kup Premium, żeby dalej dodawać kupony bez limitu.',
+      trial_active: false,
+      trial_ends_at: user.trial_ends_at,
+      is_premium: false,
+    });
   } catch (err) {
-    console.error('checkDailyLimit error:', err);
+    console.error('checkAccess error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 }
@@ -544,7 +551,9 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      'INSERT INTO users (username, email, password_hash, language) VALUES ($1, $2, $3, $4) RETURNING id, username, email, language, tax_enabled, is_premium, avatar',
+      `INSERT INTO users (username, email, password_hash, language)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, username, email, language, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, avatar`,
       [cleanUsername, cleanEmail, hash, language === 'en' ? 'en' : 'pl']
     );
     const token = signUserToken(rows[0]);
@@ -565,7 +574,10 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 
   try {
     const { rows } = await pool.query(
-      'SELECT * FROM users WHERE LOWER(email)=LOWER($1) OR LOWER(username)=LOWER($1)',
+      `SELECT users.*, ${effectivePremiumSql('users')} AS effective_is_premium,
+              ${trialActiveSql('users')} AS trial_active,
+              ${trialEndsSql('users')} AS trial_ends_at
+       FROM users WHERE LOWER(email)=LOWER($1) OR LOWER(username)=LOWER($1)`,
       [login.toLowerCase().trim()]
     );
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
@@ -582,8 +594,10 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         email: rows[0].email,
         language: rows[0].language,
         tax_enabled: rows[0].tax_enabled,
-        is_premium: rows[0].is_premium,
+        is_premium: rows[0].effective_is_premium,
         has_stripe_customer: Boolean(rows[0].stripe_customer_id),
+        trial_active: rows[0].trial_active,
+        trial_ends_at: rows[0].trial_ends_at,
         avatar: rows[0].avatar
       }
     });
@@ -596,28 +610,23 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, username, email, language, tax_enabled,
-            (is_premium OR COALESCE(premium_until, NOW()) > NOW()) AS is_premium,
-            stripe_customer_id, premium_until, avatar, daily_count, daily_reset
+            ${effectivePremiumSql('users')} AS is_premium,
+            ${trialActiveSql('users')} AS trial_active,
+            ${trialEndsSql('users')} AS trial_ends_at,
+            stripe_customer_id, premium_until, avatar
      FROM users WHERE id=$1`,
     [req.user.id]
   );
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
 
   const user = rows[0];
-  const today = todayISO();
-  const lastReset = user.daily_reset
-    ? new Date(user.daily_reset).toISOString().split('T')[0]
-    : '1970-01-01';
-  const dailyUsed = lastReset < today ? 0 : (user.daily_count || 0);
-
   res.json({
     ...user,
     stripe_customer_id: undefined,
     has_stripe_customer: Boolean(user.stripe_customer_id),
     premium_until: user.premium_until,
-    daily_used:      dailyUsed,
-    daily_limit:     user.is_premium ? null : DAILY_FREE_LIMIT,
-    daily_remaining: user.is_premium ? null : Math.max(0, DAILY_FREE_LIMIT - dailyUsed)
+    trial_days: TRIAL_DAYS,
+    can_add: Boolean(user.is_premium || user.trial_active)
   });
 });
 
@@ -856,7 +865,6 @@ app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res
       client_reference_id: String(user.id),
       metadata: { user_id: String(user.id) },
       subscription_data: { metadata: { user_id: String(user.id) } },
-      allow_promotion_codes: true,
     };
 
     if (user.stripe_customer_id) {
@@ -946,32 +954,33 @@ app.post('/api/billing/create-portal-session', authMiddleware, async (req, res) 
   }
 });
 
-// GET /api/bets/daily-limit — info o dziennym limicie kuponów
+// GET /api/bets/daily-limit — legacy endpoint name, now returns trial/Premium access
 app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { rows: userRows } = await pool.query(
-      'SELECT is_premium, daily_count, daily_reset FROM users WHERE id=$1', [userId]
+      `SELECT ${effectivePremiumSql('users')} AS is_premium,
+              ${trialActiveSql('users')} AS trial_active,
+              ${trialEndsSql('users')} AS trial_ends_at,
+              premium_until
+       FROM users WHERE id=$1`,
+      [userId]
     );
     const user = userRows[0];
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     const isPremium = user.is_premium || false;
-    const dailyLimit = isPremium ? null : DAILY_FREE_LIMIT;
-    const today = todayISO();
-    const lastReset = user.daily_reset
-      ? new Date(user.daily_reset).toISOString().split('T')[0]
-      : '1970-01-01';
-    const usedToday = lastReset < today ? 0 : Number(user.daily_count || 0);
 
     res.json({
-      used_today: usedToday,
-      daily_limit: dailyLimit ?? DAILY_FREE_LIMIT,
+      trial_active: Boolean(user.trial_active),
+      trial_ends_at: user.trial_ends_at,
+      trial_days: TRIAL_DAYS,
+      premium_until: user.premium_until,
       is_premium: isPremium,
-      can_add: isPremium || usedToday < DAILY_FREE_LIMIT
+      can_add: isPremium || user.trial_active
     });
   } catch (err) {
-    console.error('Daily limit error:', err.message);
+    console.error('Access status error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -993,8 +1002,8 @@ app.get('/api/bets', authMiddleware, apiLimiter, async (req, res) => {
   res.json(rows);
 });
 
-// POST /api/bets — z limitem dziennym dla zwykłych userów
-app.post('/api/bets', authMiddleware, apiLimiter, checkDailyLimit, async (req, res) => {
+// POST /api/bets — adding slips is available during trial or with Premium
+app.post('/api/bets', authMiddleware, apiLimiter, checkBetAccess, async (req, res) => {
   const { date, bookmaker, category, stake, odds, bet_type, notes, selections, status } = req.body;
   const parsedStake = parsePositiveNumber(stake);
   const parsedOdds = parsePositiveNumber(odds, 1);
@@ -1026,12 +1035,6 @@ app.post('/api/bets', authMiddleware, apiLimiter, checkDailyLimit, async (req, r
         cleanStatus
       ]
     );
-    if (req.dailyLimit?.shouldIncrement) {
-      await client.query(
-        'UPDATE users SET daily_count=daily_count+1, daily_reset=$1 WHERE id=$2',
-        [req.dailyLimit.today, req.user.id]
-      );
-    }
     await client.query('COMMIT');
     res.json(rows[0]);
   } catch (err) {
