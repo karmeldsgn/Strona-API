@@ -1337,9 +1337,15 @@ RULES:
 6. BET TYPE: "single" (1 selection), "accumulator" (2+ selections combined), "system".
 7. NUMBERS: Return numbers as strings with dot decimal separator, without currency symbols.
 8. SELECTIONS: If a row contains two teams and one marked pick, put teams in "match" and the selected market/pick in "pick".
+9. CATEGORY: Detect sport category from the whole slip. Use Polish names only:
+   - "Piłka nożna" for football/soccer
+   - "Koszykówka" for basketball
+   - "Tenis" for tennis
+   - if mixed, join detected categories with "/", e.g. "Piłka nożna/Tenis"
+   - if unclear or another sport, use empty string
 
 Return ONLY valid JSON, no markdown, no backticks, no explanation:
-{"bookmaker":"name or null","stake":"number","odds":"number","betType":"single|accumulator|system","date":"YYYY-MM-DD","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
+{"bookmaker":"name or null","stake":"number","odds":"number","betType":"single|accumulator|system","date":"YYYY-MM-DD","category":"Piłka nożna|Koszykówka|Tenis|mixed categories or empty string","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
           }
         ]
       }]
@@ -1361,10 +1367,26 @@ Return ONLY valid JSON, no markdown, no backticks, no explanation:
       const raw = String(value).replace(/\s/g, '').replace(',', '.').match(/\d+(?:\.\d+)?/);
       return raw ? raw[0] : '';
     };
+    const normalizeSportCategory = value => {
+      const text = String(value || '')
+        .normalize('NFKD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase();
+      const found = [];
+      if (/(pilka|nozna|football|soccer)/.test(text)) found.push('Piłka nożna');
+      if (/(koszyk|basket|nba|wnba|euroleague)/.test(text)) found.push('Koszykówka');
+      if (/(tenis|tennis|atp|wta)/.test(text)) found.push('Tenis');
+      return [...new Set(found)].join('/');
+    };
 
     parsed.stake = cleanNumber(parsed.stake);
     parsed.odds = cleanNumber(parsed.odds);
     parsed.betType = ['single', 'accumulator', 'system'].includes(parsed.betType) ? parsed.betType : 'single';
+    const categoryText = [
+      parsed.category,
+      ...(Array.isArray(parsed.selections) ? parsed.selections.map(s => `${s.category || ''} ${s.sport || ''}`) : [])
+    ].join(' ');
+    parsed.category = normalizeSportCategory(categoryText);
 
     // Sanitize: jeśli date jest pusta lub nieprawidłowa, daj today
     if (!parsed.date || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) {
