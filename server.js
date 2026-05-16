@@ -121,7 +121,7 @@ async function initDB() {
       discord_name TEXT,
       avatar TEXT,
       is_premium BOOLEAN DEFAULT FALSE,
-      trial_started_at TIMESTAMP DEFAULT NOW(),
+      trial_started_at TIMESTAMP,
       daily_count INTEGER DEFAULT 0,
       daily_reset DATE DEFAULT CURRENT_DATE,
       created_at TIMESTAMP DEFAULT NOW()
@@ -146,6 +146,11 @@ async function initDB() {
     CREATE INDEX IF NOT EXISTS idx_bets_user_id ON bets(user_id);
     CREATE INDEX IF NOT EXISTS idx_bets_status ON bets(status);
     CREATE INDEX IF NOT EXISTS idx_bets_date ON bets(date);
+
+    CREATE TABLE IF NOT EXISTS stripe_processed_payments (
+      stripe_object_id TEXT PRIMARY KEY,
+      processed_at TIMESTAMP DEFAULT NOW()
+    );
   `);
 
   // Dodaj kolumny jeśli tabela users już istnieje (migracja)
@@ -154,7 +159,8 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
-    ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP DEFAULT NOW();
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
+    ALTER TABLE users ALTER COLUMN trial_started_at DROP DEFAULT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_premium BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT UNIQUE;
@@ -180,12 +186,6 @@ async function initDB() {
       AND COALESCE(discord_premium, FALSE) = FALSE
       AND COALESCE(stripe_premium, FALSE) = FALSE
       AND premium_until IS NULL;
-  `).catch(() => {});
-
-  await pool.query(`
-    UPDATE users
-    SET trial_started_at = NOW()
-    WHERE trial_started_at IS NULL;
   `).catch(() => {});
 
   await pool.query(`
@@ -270,15 +270,21 @@ async function getAvailableUsername(base) {
 }
 
 function publicUser(row) {
+  const isPremium = Boolean(row.is_premium);
+  const trialActive = Boolean(row.trial_active);
   return {
     id: row.id,
     username: row.username,
     email: row.email,
     avatar: row.avatar,
-    is_premium: row.is_premium,
+    is_premium: isPremium,
     has_stripe_customer: Boolean(row.stripe_customer_id),
-    trial_active: Boolean(row.trial_active),
+    trial_active: trialActive,
+    trial_available: Boolean(row.trial_available),
     trial_ends_at: row.trial_ends_at,
+    trial_days: TRIAL_DAYS,
+    premium_until: row.premium_until,
+    can_add: Boolean(isPremium || trialActive),
     language: row.language,
     tax_enabled: row.tax_enabled,
   };
@@ -291,12 +297,44 @@ function effectivePremiumSql(alias = 'users') {
 
 function trialActiveSql(alias = 'users') {
   const p = alias ? `${alias}.` : '';
-  return `(COALESCE(${p}trial_started_at, ${p}created_at, NOW()) + (${TRIAL_DAYS} * INTERVAL '1 day') > NOW())`;
+  return `(${p}trial_started_at IS NOT NULL AND ${p}trial_started_at + (${TRIAL_DAYS} * INTERVAL '1 day') > NOW())`;
 }
 
 function trialEndsSql(alias = 'users') {
   const p = alias ? `${alias}.` : '';
-  return `(COALESCE(${p}trial_started_at, ${p}created_at, NOW()) + (${TRIAL_DAYS} * INTERVAL '1 day'))`;
+  return `(CASE WHEN ${p}trial_started_at IS NULL THEN NULL ELSE ${p}trial_started_at + (${TRIAL_DAYS} * INTERVAL '1 day') END)`;
+}
+
+function trialAvailableSql(alias = 'users') {
+  const p = alias ? `${alias}.` : '';
+  return `(${p}trial_started_at IS NULL)`;
+}
+
+function accessPayload(row) {
+  const isPremium = Boolean(row?.is_premium);
+  const trialActive = Boolean(row?.trial_active);
+  return {
+    trial_active: trialActive,
+    trial_available: Boolean(row?.trial_available),
+    trial_ends_at: row?.trial_ends_at || null,
+    trial_days: TRIAL_DAYS,
+    premium_until: row?.premium_until || null,
+    is_premium: isPremium,
+    can_add: Boolean(isPremium || trialActive),
+  };
+}
+
+async function getUserAccess(userId) {
+  const { rows } = await pool.query(
+    `SELECT id, username, email, avatar, language, tax_enabled, stripe_customer_id, premium_until,
+            ${effectivePremiumSql('users')} AS is_premium,
+            ${trialActiveSql('users')} AS trial_active,
+            ${trialAvailableSql('users')} AS trial_available,
+            ${trialEndsSql('users')} AS trial_ends_at
+     FROM users WHERE id=$1`,
+    [userId]
+  );
+  return rows[0] || null;
 }
 
 function signUserToken(user) {
@@ -331,7 +369,7 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
         avatar=COALESCE($3, avatar)
         ${premiumSql}
     WHERE id=$4
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, language, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, tax_enabled
   `, params);
   return rows[0];
 }
@@ -364,7 +402,7 @@ async function upsertOAuthUser({ provider, providerId, username, email, avatar, 
   const { rows } = await pool.query(`
     INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium)
     VALUES ($1, $2, $3, $4, '', $5, $6)
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, language, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, tax_enabled
   `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
   return rows[0];
 }
@@ -413,8 +451,23 @@ async function syncStripeSubscription({ userId, customerId, subscriptionId, stat
   return rows[0] || null;
 }
 
-async function grantOneTimePremium({ userId, customerId, days }) {
+async function markStripeObjectProcessed(idempotencyKey) {
+  if (!idempotencyKey) return true;
+  const { rowCount } = await pool.query(
+    `INSERT INTO stripe_processed_payments (stripe_object_id)
+     VALUES ($1)
+     ON CONFLICT (stripe_object_id) DO NOTHING`,
+    [String(idempotencyKey)]
+  );
+  return rowCount > 0;
+}
+
+async function grantOneTimePremium({ userId, customerId, days, idempotencyKey }) {
   if (!userId && !customerId) return null;
+  const shouldGrant = await markStripeObjectProcessed(idempotencyKey);
+  if (!shouldGrant && userId) return getUserAccess(Number(userId));
+  if (!shouldGrant) return null;
+
   const validDays = Math.max(Number.parseInt(days || oneTimePremiumDays(), 10) || oneTimePremiumDays(), 1);
   const params = [customerId || null, validDays];
   let where;
@@ -438,21 +491,40 @@ async function grantOneTimePremium({ userId, customerId, days }) {
 }
 
 async function handleStripeEvent(event) {
-  if (event.type === 'checkout.session.completed') {
+  if (event.type === 'checkout.session.completed' || event.type === 'checkout.session.async_payment_succeeded') {
     const session = event.data.object;
     if (session.mode === 'subscription') {
+      let status = 'active';
+      if (session.subscription && stripe) {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        status = subscription.status || status;
+      }
       await syncStripeSubscription({
         userId: session.client_reference_id || session.metadata?.user_id,
         customerId: session.customer,
         subscriptionId: session.subscription,
-        status: 'active',
+        status,
       });
     }
-    if (session.mode === 'payment') {
+    if (session.mode === 'payment' && (session.payment_status === 'paid' || event.type === 'checkout.session.async_payment_succeeded')) {
       await grantOneTimePremium({
         userId: session.client_reference_id || session.metadata?.user_id,
         customerId: session.customer,
         days: session.metadata?.premium_days,
+        idempotencyKey: session.payment_intent || session.id,
+      });
+    }
+    return;
+  }
+
+  if (event.type === 'payment_intent.succeeded') {
+    const paymentIntent = event.data.object;
+    if (paymentIntent.metadata?.purchase_type === 'premium_onetime') {
+      await grantOneTimePremium({
+        userId: paymentIntent.metadata?.user_id,
+        customerId: paymentIntent.customer,
+        days: paymentIntent.metadata?.premium_days,
+        idempotencyKey: paymentIntent.id,
       });
     }
     return;
@@ -510,6 +582,7 @@ async function checkBetAccess(req, res, next) {
     const { rows } = await pool.query(
       `SELECT ${effectivePremiumSql('users')} AS is_premium,
               ${trialActiveSql('users')} AS trial_active,
+              ${trialAvailableSql('users')} AS trial_available,
               ${trialEndsSql('users')} AS trial_ends_at
        FROM users WHERE id=$1`,
       [req.user.id]
@@ -520,9 +593,12 @@ async function checkBetAccess(req, res, next) {
     if (user.is_premium || user.trial_active) return next();
 
     return res.status(402).json({
-      error: 'Trial expired',
-      message: 'Twój 3-dniowy okres próbny minął. Kup Premium, żeby dalej dodawać kupony bez limitu.',
+      error: user.trial_available ? 'Trial not activated' : 'Trial expired',
+      message: user.trial_available
+        ? 'Aktywuj 3-dniowy okres probny, zeby korzystac z tej funkcji.'
+        : 'Twoj 3-dniowy okres probny minal. Kup Premium, zeby dalej dodawac kupony bez limitu.',
       trial_active: false,
+      trial_available: Boolean(user.trial_available),
       trial_ends_at: user.trial_ends_at,
       is_premium: false,
     });
@@ -553,7 +629,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO users (username, email, password_hash, language)
        VALUES ($1, $2, $3, $4)
-       RETURNING id, username, email, language, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, avatar`,
+       RETURNING id, username, email, language, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
       [cleanUsername, cleanEmail, hash, language === 'en' ? 'en' : 'pl']
     );
     const token = signUserToken(rows[0]);
@@ -576,6 +652,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT users.*, ${effectivePremiumSql('users')} AS effective_is_premium,
               ${trialActiveSql('users')} AS trial_active,
+              ${trialAvailableSql('users')} AS trial_available,
               ${trialEndsSql('users')} AS trial_ends_at
        FROM users WHERE LOWER(email)=LOWER($1) OR LOWER(username)=LOWER($1)`,
       [login.toLowerCase().trim()]
@@ -597,7 +674,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         is_premium: rows[0].effective_is_premium,
         has_stripe_customer: Boolean(rows[0].stripe_customer_id),
         trial_active: rows[0].trial_active,
+        trial_available: rows[0].trial_available,
         trial_ends_at: rows[0].trial_ends_at,
+        trial_days: TRIAL_DAYS,
+        premium_until: rows[0].premium_until,
+        can_add: Boolean(rows[0].effective_is_premium || rows[0].trial_active),
         avatar: rows[0].avatar
       }
     });
@@ -612,6 +693,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     `SELECT id, username, email, language, tax_enabled,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
+            ${trialAvailableSql('users')} AS trial_available,
             ${trialEndsSql('users')} AS trial_ends_at,
             stripe_customer_id, premium_until, avatar
      FROM users WHERE id=$1`,
@@ -625,9 +707,38 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
     stripe_customer_id: undefined,
     has_stripe_customer: Boolean(user.stripe_customer_id),
     premium_until: user.premium_until,
+    trial_available: Boolean(user.trial_available),
     trial_days: TRIAL_DAYS,
     can_add: Boolean(user.is_premium || user.trial_active)
   });
+});
+
+app.post('/api/trial/activate', authMiddleware, async (req, res) => {
+  try {
+    const current = await getUserAccess(req.user.id);
+    if (!current) return res.status(404).json({ error: 'User not found' });
+
+    if (!current.trial_available) {
+      return res.json({ user: publicUser(current), access: accessPayload(current), already_started: true });
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET trial_started_at=NOW()
+       WHERE id=$1 AND trial_started_at IS NULL
+       RETURNING id, username, email, avatar, language, tax_enabled, stripe_customer_id, premium_until,
+                 ${effectivePremiumSql('')} AS is_premium,
+                 ${trialActiveSql('')} AS trial_active,
+                 ${trialAvailableSql('')} AS trial_available,
+                 ${trialEndsSql('')} AS trial_ends_at`,
+      [req.user.id]
+    );
+    const user = rows[0] || await getUserAccess(req.user.id);
+    res.json({ user: publicUser(user), access: accessPayload(user), activated: true });
+  } catch (err) {
+    console.error('Trial activation error:', err);
+    res.status(500).json({ error: 'Could not activate trial' });
+  }
 });
 
 app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
@@ -860,7 +971,7 @@ app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res
       mode: 'subscription',
       line_items: [{ price: process.env.STRIPE_PREMIUM_PRICE_ID, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${FRONTEND_URL}?billing=success`,
+      success_url: `${FRONTEND_URL}?billing=success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?billing=cancel`,
       client_reference_id: String(user.id),
       metadata: { user_id: String(user.id) },
@@ -900,7 +1011,7 @@ app.post('/api/billing/create-onetime-checkout-session', authMiddleware, async (
       payment_method_types: ['card', 'blik'],
       line_items: [{ price: process.env.STRIPE_ONETIME_PRICE_ID, quantity: 1 }],
       allow_promotion_codes: true,
-      success_url: `${FRONTEND_URL}?billing=onetime_success`,
+      success_url: `${FRONTEND_URL}?billing=onetime_success&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${FRONTEND_URL}?billing=cancel`,
       client_reference_id: String(user.id),
       metadata: {
@@ -922,6 +1033,7 @@ app.post('/api/billing/create-onetime-checkout-session', authMiddleware, async (
       sessionPayload.customer = user.stripe_customer_id;
     } else if (user.email) {
       sessionPayload.customer_email = user.email;
+      sessionPayload.customer_creation = 'always';
     }
 
     const session = await stripe.checkout.sessions.create(sessionPayload);
@@ -929,6 +1041,58 @@ app.post('/api/billing/create-onetime-checkout-session', authMiddleware, async (
   } catch (err) {
     console.error('Stripe one-time checkout error:', err);
     res.status(500).json({ error: 'Could not create one-time checkout session' });
+  }
+});
+
+app.post('/api/billing/verify-session', authMiddleware, async (req, res) => {
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured' });
+
+  const sessionId = String(req.body?.session_id || '').trim();
+  if (!sessionId.startsWith('cs_')) return res.status(400).json({ error: 'Invalid Stripe session' });
+
+  try {
+    const session = await stripe.checkout.sessions.retrieve(sessionId, {
+      expand: ['subscription', 'payment_intent'],
+    });
+
+    const ownerId = session.client_reference_id || session.metadata?.user_id;
+    if (String(ownerId) !== String(req.user.id)) {
+      return res.status(403).json({ error: 'This payment belongs to a different account' });
+    }
+
+    if (session.mode === 'subscription') {
+      const subscription = session.subscription;
+      const subscriptionId = typeof subscription === 'string' ? subscription : subscription?.id;
+      const status = typeof subscription === 'string'
+        ? (await stripe.subscriptions.retrieve(subscription)).status
+        : subscription?.status;
+
+      await syncStripeSubscription({
+        userId: req.user.id,
+        customerId: session.customer,
+        subscriptionId,
+        status: status || 'active',
+      });
+    } else if (session.mode === 'payment') {
+      if (session.payment_status !== 'paid') {
+        return res.status(409).json({ error: 'Payment is not completed yet' });
+      }
+
+      const paymentIntent = session.payment_intent;
+      const paymentIntentId = typeof paymentIntent === 'string' ? paymentIntent : paymentIntent?.id;
+      await grantOneTimePremium({
+        userId: req.user.id,
+        customerId: session.customer,
+        days: session.metadata?.premium_days,
+        idempotencyKey: paymentIntentId || session.id,
+      });
+    }
+
+    const user = await getUserAccess(req.user.id);
+    res.json({ ok: true, user: publicUser(user), access: accessPayload(user) });
+  } catch (err) {
+    console.error('Stripe verify session error:', err);
+    res.status(500).json({ error: 'Could not verify Stripe payment' });
   }
 });
 
@@ -961,6 +1125,7 @@ app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
     const { rows: userRows } = await pool.query(
       `SELECT ${effectivePremiumSql('users')} AS is_premium,
               ${trialActiveSql('users')} AS trial_active,
+              ${trialAvailableSql('users')} AS trial_available,
               ${trialEndsSql('users')} AS trial_ends_at,
               premium_until
        FROM users WHERE id=$1`,
@@ -973,6 +1138,7 @@ app.get('/api/bets/daily-limit', authMiddleware, async (req, res) => {
 
     res.json({
       trial_active: Boolean(user.trial_active),
+      trial_available: Boolean(user.trial_available),
       trial_ends_at: user.trial_ends_at,
       trial_days: TRIAL_DAYS,
       premium_until: user.premium_until,
@@ -1132,7 +1298,7 @@ app.get('/api/bets/stats', authMiddleware, async (req, res) => {
 });
 
 // ─── AI SCAN ROUTE ────────────────────────────────────────────────────────────
-app.post('/api/scan', authMiddleware, scanLimiter, upload.single('image'), async (req, res) => {
+app.post('/api/scan', authMiddleware, scanLimiter, checkBetAccess, upload.single('image'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No image provided' });
   const openai = getOpenAIClient();
   if (!openai) return res.status(503).json({ error: 'AI scanning not configured' });
@@ -1145,7 +1311,8 @@ app.post('/api/scan', authMiddleware, scanLimiter, upload.single('image'), async
     const mime = req.file.mimetype;
 
     const response = await openai.chat.completions.create({
-      model: 'gpt-4o',
+      model: process.env.OPENAI_SCAN_MODEL || 'gpt-4o',
+      response_format: { type: 'json_object' },
       max_tokens: 1200,
       messages: [{
         role: 'user',
@@ -1165,9 +1332,11 @@ RULES:
    - "lost" ONLY IF: red background/text, ✗ cross, text "przegrany"/"lost"/"przegrana"
    - "pending" = anything else, including unclear or ambiguous cases
 3. STAKE: Extract the exact number. Remove currency symbols. Use dot as decimal separator.
-4. ODDS: Total combined odds of the slip (the big number, not individual selection odds).
+4. ODDS: Total combined odds of the slip (the big number, not individual selection odds). If only one selection exists, use that selection odds.
 5. BOOKMAKER: Name of the bookmaker if visible, else null.
 6. BET TYPE: "single" (1 selection), "accumulator" (2+ selections combined), "system".
+7. NUMBERS: Return numbers as strings with dot decimal separator, without currency symbols.
+8. SELECTIONS: If a row contains two teams and one marked pick, put teams in "match" and the selected market/pick in "pick".
 
 Return ONLY valid JSON, no markdown, no backticks, no explanation:
 {"bookmaker":"name or null","stake":"number","odds":"number","betType":"single|accumulator|system","date":"YYYY-MM-DD","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
@@ -1180,11 +1349,22 @@ Return ONLY valid JSON, no markdown, no backticks, no explanation:
 
     let parsed;
     try {
-      parsed = JSON.parse(text);
+      const jsonText = text?.startsWith('{') ? text : text?.match(/\{[\s\S]*\}/)?.[0];
+      parsed = JSON.parse(jsonText);
     } catch (parseErr) {
       console.error('Scan JSON parse error:', text);
       return res.status(500).json({ error: 'AI zwróciło nieprawidłowy JSON. Spróbuj ponownie.' });
     }
+
+    const cleanNumber = value => {
+      if (value === undefined || value === null) return '';
+      const raw = String(value).replace(/\s/g, '').replace(',', '.').match(/\d+(?:\.\d+)?/);
+      return raw ? raw[0] : '';
+    };
+
+    parsed.stake = cleanNumber(parsed.stake);
+    parsed.odds = cleanNumber(parsed.odds);
+    parsed.betType = ['single', 'accumulator', 'system'].includes(parsed.betType) ? parsed.betType : 'single';
 
     // Sanitize: jeśli date jest pusta lub nieprawidłowa, daj today
     if (!parsed.date || !/^\d{4}-\d{2}-\d{2}$/.test(parsed.date)) {
@@ -1198,8 +1378,18 @@ Return ONLY valid JSON, no markdown, no backticks, no explanation:
     if (Array.isArray(parsed.selections)) {
       parsed.selections = parsed.selections.map(s => ({
         ...s,
+        odds: cleanNumber(s.odds),
         status: ['won', 'lost', 'pending'].includes(s.status) ? s.status : 'pending'
       }));
+    } else {
+      parsed.selections = [];
+    }
+
+    if (parsed.selections.length) {
+      const statuses = parsed.selections.map(s => s.status);
+      if (statuses.includes('lost')) parsed.betStatus = 'lost';
+      else if (statuses.every(s => s === 'won')) parsed.betStatus = 'won';
+      else parsed.betStatus = 'pending';
     }
 
     res.json(parsed);
