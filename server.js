@@ -121,6 +121,10 @@ async function initDB() {
       discord_name TEXT,
       avatar TEXT,
       is_premium BOOLEAN DEFAULT FALSE,
+      admin_premium BOOLEAN DEFAULT FALSE,
+      admin_note TEXT,
+      last_seen_at TIMESTAMP,
+      last_login_at TIMESTAMP,
       trial_started_at TIMESTAMP,
       daily_count INTEGER DEFAULT 0,
       daily_reset DATE DEFAULT CURRENT_DATE,
@@ -159,6 +163,10 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_name TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS is_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_note TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
     ALTER TABLE users ALTER COLUMN trial_started_at DROP DEFAULT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
@@ -180,9 +188,27 @@ async function initDB() {
   `).catch(() => {});
 
   await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_premium BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_note TEXT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
+  `).catch(() => {});
+
+  await pool.query(`
+    UPDATE users
+    SET admin_premium = TRUE
+    WHERE is_premium = TRUE
+      AND COALESCE(admin_premium, FALSE) = FALSE
+      AND COALESCE(discord_premium, FALSE) = FALSE
+      AND COALESCE(stripe_premium, FALSE) = FALSE
+      AND premium_until IS NULL;
+  `).catch(() => {});
+
+  await pool.query(`
     UPDATE users
     SET discord_premium = TRUE
     WHERE is_premium = TRUE
+      AND COALESCE(admin_premium, FALSE) = FALSE
       AND COALESCE(discord_premium, FALSE) = FALSE
       AND COALESCE(stripe_premium, FALSE) = FALSE
       AND premium_until IS NULL;
@@ -206,6 +232,47 @@ function authMiddleware(req, res, next) {
     next();
   } catch {
     res.status(401).json({ error: 'Invalid token' });
+  }
+}
+
+function splitEnvList(...values) {
+  const set = new Set();
+  values.forEach(value => {
+    String(value || '')
+      .split(',')
+      .map(item => item.trim().toLowerCase())
+      .filter(Boolean)
+      .forEach(item => set.add(item));
+  });
+  return set;
+}
+
+function isAdminIdentity(row) {
+  if (!row) return false;
+  const ids = splitEnvList(process.env.ADMIN_USER_IDS, process.env.ADMIN_IDS);
+  const emails = splitEnvList(process.env.ADMIN_EMAILS, process.env.ADMIN_EMAIL);
+  const usernames = splitEnvList(process.env.ADMIN_USERNAMES, process.env.ADMIN_USERNAME);
+  return (
+    ids.has(String(row.id || '').toLowerCase()) ||
+    emails.has(String(row.email || '').toLowerCase()) ||
+    usernames.has(String(row.username || '').toLowerCase())
+  );
+}
+
+async function adminMiddleware(req, res, next) {
+  try {
+    const { rows } = await pool.query(
+      'SELECT id, username, email FROM users WHERE id=$1',
+      [req.user.id]
+    );
+    const admin = rows[0];
+    if (!admin) return res.status(404).json({ error: 'User not found' });
+    if (!isAdminIdentity(admin)) return res.status(403).json({ error: 'Admin only' });
+    req.admin = admin;
+    next();
+  } catch (err) {
+    console.error('Admin auth error:', err);
+    res.status(500).json({ error: 'Server error' });
   }
 }
 
@@ -278,6 +345,7 @@ function publicUser(row) {
     email: row.email,
     avatar: row.avatar,
     is_premium: isPremium,
+    is_admin: isAdminIdentity(row),
     has_stripe_customer: Boolean(row.stripe_customer_id),
     trial_active: trialActive,
     trial_available: Boolean(row.trial_available),
@@ -292,7 +360,7 @@ function publicUser(row) {
 
 function effectivePremiumSql(alias = 'users') {
   const p = alias ? `${alias}.` : '';
-  return `(COALESCE(${p}discord_premium, false) OR COALESCE(${p}stripe_premium, false) OR COALESCE(${p}premium_until, NOW()) > NOW())`;
+  return `(COALESCE(${p}admin_premium, false) OR COALESCE(${p}discord_premium, false) OR COALESCE(${p}stripe_premium, false) OR COALESCE(${p}premium_until, NOW()) > NOW())`;
 }
 
 function trialActiveSql(alias = 'users') {
@@ -359,7 +427,7 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
   let premiumSql = '';
   if (typeof isPremium === 'boolean') {
     params.push(isPremium);
-    premiumSql = `, discord_premium=$${params.length}, is_premium=($${params.length} OR COALESCE(stripe_premium, false))`;
+    premiumSql = `, discord_premium=$${params.length}, is_premium=($${params.length} OR COALESCE(stripe_premium, false) OR COALESCE(admin_premium, false) OR COALESCE(premium_until, NOW()) > NOW())`;
   }
 
   const { rows } = await pool.query(`
@@ -633,7 +701,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
       [cleanUsername, cleanEmail, hash, language === 'en' ? 'en' : 'pl']
     );
     const token = signUserToken(rows[0]);
-    res.json({ token, user: rows[0] });
+    res.json({ token, user: publicUser(rows[0]) });
   } catch (e) {
     if (e.code === '23505') {
       const field = e.constraint?.includes('email') ? 'Email' : 'Username';
@@ -662,6 +730,11 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
     const valid = await bcrypt.compare(password, rows[0].password_hash);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
+    await pool.query(
+      'UPDATE users SET last_login_at=NOW(), last_seen_at=NOW() WHERE id=$1',
+      [rows[0].id]
+    ).catch(() => {});
+
     const token = signUserToken(rows[0]);
     res.json({
       token,
@@ -672,6 +745,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         language: rows[0].language,
         tax_enabled: rows[0].tax_enabled,
         is_premium: rows[0].effective_is_premium,
+        is_admin: isAdminIdentity(rows[0]),
         has_stripe_customer: Boolean(rows[0].stripe_customer_id),
         trial_active: rows[0].trial_active,
         trial_available: rows[0].trial_available,
@@ -689,6 +763,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 });
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
+  await pool.query('UPDATE users SET last_seen_at=NOW() WHERE id=$1', [req.user.id]).catch(() => {});
   const { rows } = await pool.query(
     `SELECT id, username, email, language, tax_enabled,
             ${effectivePremiumSql('users')} AS is_premium,
@@ -702,15 +777,7 @@ app.get('/api/auth/me', authMiddleware, async (req, res) => {
   if (!rows.length) return res.status(404).json({ error: 'Not found' });
 
   const user = rows[0];
-  res.json({
-    ...user,
-    stripe_customer_id: undefined,
-    has_stripe_customer: Boolean(user.stripe_customer_id),
-    premium_until: user.premium_until,
-    trial_available: Boolean(user.trial_available),
-    trial_days: TRIAL_DAYS,
-    can_add: Boolean(user.is_premium || user.trial_active)
-  });
+  res.json(publicUser(user));
 });
 
 app.post('/api/trial/activate', authMiddleware, async (req, res) => {
@@ -750,6 +817,191 @@ app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
 
 // ─── DISCORD OAUTH ────────────────────────────────────────────────────────────
 // KROK 1: Redirect do Discord
+function adminUserStatsSql(whereClause = '') {
+  return `
+    WITH bet_stats AS (
+      SELECT
+        user_id,
+        COUNT(*)::int AS total_bets,
+        (COUNT(*) FILTER (WHERE status='won'))::int AS won_bets,
+        (COUNT(*) FILTER (WHERE status='lost'))::int AS lost_bets,
+        (COUNT(*) FILTER (WHERE status='pending'))::int AS pending_bets,
+        (COUNT(*) FILTER (WHERE status='void'))::int AS void_bets,
+        COALESCE(SUM(stake), 0) AS total_stake,
+        COALESCE(SUM(stake) FILTER (WHERE status IN ('won','lost')), 0) AS settled_stake,
+        COALESCE(SUM(CASE
+          WHEN status='won' THEN stake * odds - stake
+          WHEN status='lost' THEN -stake
+          ELSE 0
+        END), 0) AS profit,
+        MAX(created_at) AS last_bet_at
+      FROM bets
+      GROUP BY user_id
+    )
+    SELECT
+      users.id,
+      users.username,
+      users.email,
+      users.avatar,
+      users.language,
+      users.tax_enabled,
+      users.created_at,
+      users.last_seen_at,
+      users.last_login_at,
+      users.admin_premium,
+      users.discord_premium,
+      users.stripe_premium,
+      users.stripe_subscription_status,
+      users.stripe_customer_id,
+      users.premium_until,
+      ${effectivePremiumSql('users')} AS is_premium,
+      ${trialActiveSql('users')} AS trial_active,
+      ${trialAvailableSql('users')} AS trial_available,
+      ${trialEndsSql('users')} AS trial_ends_at,
+      COALESCE(bs.total_bets, 0)::int AS total_bets,
+      COALESCE(bs.won_bets, 0)::int AS won_bets,
+      COALESCE(bs.lost_bets, 0)::int AS lost_bets,
+      COALESCE(bs.pending_bets, 0)::int AS pending_bets,
+      COALESCE(bs.void_bets, 0)::int AS void_bets,
+      COALESCE(bs.total_stake, 0) AS total_stake,
+      COALESCE(bs.settled_stake, 0) AS settled_stake,
+      COALESCE(bs.profit, 0) AS profit,
+      CASE
+        WHEN COALESCE(bs.settled_stake, 0) > 0
+        THEN ROUND((COALESCE(bs.profit, 0) / bs.settled_stake * 100)::numeric, 2)
+        ELSE 0
+      END AS roi,
+      bs.last_bet_at
+    FROM users
+    LEFT JOIN bet_stats bs ON bs.user_id = users.id
+    ${whereClause}
+  `;
+}
+
+async function getAdminUserDetails(userId) {
+  const { rows } = await pool.query(
+    `${adminUserStatsSql('WHERE users.id=$1')} LIMIT 1`,
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) => {
+  try {
+    const safeLimit = Math.min(Math.max(parseInt(req.query.limit, 10) || 80, 1), 200);
+    const safeOffset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const search = normalizeText(req.query.search, 100);
+    const params = [];
+    let where = '';
+
+    if (search) {
+      params.push(`%${search.toLowerCase()}%`);
+      where = `WHERE LOWER(COALESCE(users.username, '')) LIKE $${params.length}
+               OR LOWER(COALESCE(users.email, '')) LIKE $${params.length}`;
+    }
+
+    const listParams = [...params, safeLimit, safeOffset];
+    const { rows } = await pool.query(
+      `${adminUserStatsSql(where)}
+       ORDER BY COALESCE(users.last_seen_at, users.last_login_at, users.created_at) DESC
+       LIMIT $${listParams.length - 1} OFFSET $${listParams.length}`,
+      listParams
+    );
+
+    const { rows: summaryRows } = await pool.query(`
+      SELECT
+        COUNT(*)::int AS total_users,
+        (COUNT(*) FILTER (WHERE ${effectivePremiumSql('users')}))::int AS premium_users,
+        (COUNT(*) FILTER (WHERE ${trialActiveSql('users')}))::int AS active_trials,
+        (COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '24 hours'))::int AS active_today
+      FROM users
+    `);
+
+    res.json({ users: rows, summary: summaryRows[0] || {} });
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/premium', authMiddleware, adminMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  const action = String(req.body?.action || '').trim();
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Invalid user id' });
+
+  try {
+    if (action === 'grant') {
+      await pool.query(
+        `UPDATE users
+         SET admin_premium=TRUE, is_premium=TRUE
+         WHERE id=$1`,
+        [userId]
+      );
+    } else if (action === 'grant_days') {
+      const days = Math.min(Math.max(parseInt(req.body?.days, 10) || 30, 1), 3650);
+      await pool.query(
+        `UPDATE users
+         SET admin_premium=FALSE,
+             premium_until=GREATEST(COALESCE(premium_until, NOW()), NOW()) + ($2::int * INTERVAL '1 day'),
+             is_premium=TRUE
+         WHERE id=$1`,
+        [userId, days]
+      );
+    } else if (action === 'revoke') {
+      await pool.query(
+        `UPDATE users
+         SET admin_premium=FALSE,
+             discord_premium=FALSE,
+             stripe_premium=FALSE,
+             premium_until=NULL,
+             is_premium=FALSE,
+             stripe_subscription_status=COALESCE(stripe_subscription_status, 'admin_revoked')
+         WHERE id=$1`,
+        [userId]
+      );
+    } else {
+      return res.status(400).json({ error: 'Invalid premium action' });
+    }
+
+    const user = await getAdminUserDetails(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error('Admin premium error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/trial', authMiddleware, adminMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  const action = String(req.body?.action || '').trim();
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Invalid user id' });
+
+  try {
+    if (action === 'reset') {
+      await pool.query('UPDATE users SET trial_started_at=NULL WHERE id=$1', [userId]);
+    } else if (action === 'start') {
+      await pool.query('UPDATE users SET trial_started_at=NOW() WHERE id=$1', [userId]);
+    } else if (action === 'expire') {
+      await pool.query(
+        `UPDATE users
+         SET trial_started_at=NOW() - (($2::int + 1) * INTERVAL '1 day')
+         WHERE id=$1`,
+        [userId, TRIAL_DAYS]
+      );
+    } else {
+      return res.status(400).json({ error: 'Invalid trial action' });
+    }
+
+    const user = await getAdminUserDetails(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error('Admin trial error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 app.get('/api/auth/discord', (req, res) => {
   const params = new URLSearchParams({
     client_id:     process.env.DISCORD_CLIENT_ID,
