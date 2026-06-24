@@ -116,6 +116,7 @@ async function initDB() {
       email VARCHAR(255) UNIQUE,
       password_hash VARCHAR(255) NOT NULL DEFAULT '',
       language VARCHAR(5) DEFAULT 'pl',
+      currency VARCHAR(3) DEFAULT 'PLN',
       tax_enabled BOOLEAN DEFAULT FALSE,
       discord_id TEXT UNIQUE,
       discord_name TEXT,
@@ -139,6 +140,8 @@ async function initDB() {
       category VARCHAR(50),
       stake DECIMAL(10,2) NOT NULL,
       odds DECIMAL(10,4) NOT NULL,
+      tax_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      tax_rate DECIMAL(5,4) NOT NULL DEFAULT 0.12,
       bet_type VARCHAR(50) DEFAULT 'single',
       notes TEXT,
       status VARCHAR(20) DEFAULT 'pending',
@@ -155,6 +158,41 @@ async function initDB() {
       stripe_object_id TEXT PRIMARY KEY,
       processed_at TIMESTAMP DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS billing_events (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      provider VARCHAR(30) NOT NULL DEFAULT 'stripe',
+      purchase_type VARCHAR(50) NOT NULL,
+      status VARCHAR(30) NOT NULL,
+      amount_total BIGINT,
+      currency VARCHAR(10),
+      external_id TEXT UNIQUE,
+      customer_id TEXT,
+      subscription_id TEXT,
+      occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_billing_events_user_id ON billing_events(user_id);
+    CREATE INDEX IF NOT EXISTS idx_billing_events_occurred_at ON billing_events(occurred_at DESC);
+
+    CREATE TABLE IF NOT EXISTS admin_audit_log (
+      id BIGSERIAL PRIMARY KEY,
+      admin_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      target_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      action VARCHAR(80) NOT NULL,
+      details JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_admin_audit_target ON admin_audit_log(target_user_id, created_at DESC);
+  `);
+
+  await pool.query(`
+    ALTER TABLE bets ADD COLUMN IF NOT EXISTS tax_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE bets ADD COLUMN IF NOT EXISTS tax_rate DECIMAL(5,4) NOT NULL DEFAULT 0.12;
   `);
 
   // Dodaj kolumny jeśli tabela users już istnieje (migracja)
@@ -167,6 +205,7 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_note TEXT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'PLN';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
     ALTER TABLE users ALTER COLUMN trial_started_at DROP DEFAULT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
@@ -278,6 +317,8 @@ async function adminMiddleware(req, res, next) {
 
 const VALID_STATUSES = new Set(['pending', 'won', 'lost', 'void']);
 const VALID_BET_TYPES = new Set(['single', 'accumulator', 'system']);
+const VALID_LANGUAGES = new Set(['pl', 'en', 'de', 'ru', 'cs', 'es', 'it']);
+const VALID_CURRENCIES = new Set(['PLN', 'EUR', 'USD', 'CZK']);
 const PROVIDER_COLUMNS = {
   discord: 'discord_id',
   google: 'google_id',
@@ -292,11 +333,25 @@ function normalizeEmail(email) {
   return email ? String(email).trim().toLowerCase() : null;
 }
 
+function normalizeLanguage(value) {
+  const language = String(value || '').trim().toLowerCase();
+  return VALID_LANGUAGES.has(language) ? language : 'pl';
+}
+
+function normalizeCurrency(value) {
+  const currency = String(value || '').trim().toUpperCase();
+  return VALID_CURRENCIES.has(currency) ? currency : 'PLN';
+}
+
 function normalizeText(value, maxLength) {
   if (value === undefined || value === null) return null;
   const text = String(value).trim();
   if (!text) return null;
   return text.slice(0, maxLength);
+}
+
+function parseBoolean(value) {
+  return value === true || value === 1 || ['true', '1', 'on', 'yes'].includes(String(value || '').toLowerCase());
 }
 
 function parsePositiveNumber(value, min = 0) {
@@ -354,6 +409,7 @@ function publicUser(row) {
     premium_until: row.premium_until,
     can_add: Boolean(isPremium || trialActive),
     language: row.language,
+    currency: row.currency || 'PLN',
     tax_enabled: row.tax_enabled,
   };
 }
@@ -394,7 +450,7 @@ function accessPayload(row) {
 
 async function getUserAccess(userId) {
   const { rows } = await pool.query(
-    `SELECT id, username, email, avatar, language, tax_enabled, stripe_customer_id, premium_until,
+    `SELECT id, username, email, avatar, language, currency, tax_enabled, stripe_customer_id, premium_until,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -434,10 +490,12 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
     UPDATE users
     SET ${providerColumn}=$1,
         email=COALESCE($2, email),
-        avatar=COALESCE($3, avatar)
+        avatar=COALESCE($3, avatar),
+        last_login_at=NOW(),
+        last_seen_at=NOW()
         ${premiumSql}
     WHERE id=$4
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled
   `, params);
   return rows[0];
 }
@@ -468,9 +526,9 @@ async function upsertOAuthUser({ provider, providerId, username, email, avatar, 
   const finalUsername = await getAvailableUsername(username || `${provider}_${providerId}`);
   const discordPremium = provider === 'discord' ? Boolean(isPremium) : false;
   const { rows } = await pool.query(`
-    INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium)
-    VALUES ($1, $2, $3, $4, '', $5, $6)
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, tax_enabled
+    INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium, last_login_at, last_seen_at)
+    VALUES ($1, $2, $3, $4, '', $5, $6, NOW(), NOW())
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled
   `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
   return rows[0];
 }
@@ -481,6 +539,148 @@ function stripeActiveStatus(status) {
 
 function oneTimePremiumDays() {
   return Math.max(Number.parseInt(process.env.STRIPE_ONETIME_PREMIUM_DAYS || '30', 10) || 30, 1);
+}
+
+function stripeOccurredAt(unixSeconds) {
+  const seconds = Number(unixSeconds);
+  return Number.isFinite(seconds) && seconds > 0 ? new Date(seconds * 1000) : new Date();
+}
+
+async function resolveBillingUserId({ userId, customerId, subscriptionId }) {
+  const parsedUserId = Number.parseInt(userId, 10);
+  if (Number.isInteger(parsedUserId) && parsedUserId > 0) return parsedUserId;
+
+  if (customerId) {
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE stripe_customer_id=$1 LIMIT 1',
+      [String(customerId)]
+    );
+    if (rows[0]?.id) return rows[0].id;
+  }
+
+  if (subscriptionId) {
+    const { rows } = await pool.query(
+      'SELECT id FROM users WHERE stripe_subscription_id=$1 LIMIT 1',
+      [String(subscriptionId)]
+    );
+    if (rows[0]?.id) return rows[0].id;
+  }
+
+  return null;
+}
+
+async function recordBillingEvent({
+  userId,
+  customerId,
+  subscriptionId,
+  purchaseType,
+  status,
+  amountTotal,
+  currency,
+  externalId,
+  occurredAt,
+  metadata,
+}) {
+  if (!purchaseType || !status || !externalId) return null;
+  const resolvedUserId = await resolveBillingUserId({ userId, customerId, subscriptionId });
+  const safeAmount = Number.isFinite(Number(amountTotal)) ? Math.max(Math.round(Number(amountTotal)), 0) : null;
+  const safeCurrency = currency ? String(currency).trim().toLowerCase().slice(0, 10) : null;
+  const safeMetadata = metadata && typeof metadata === 'object' ? metadata : {};
+
+  const { rows } = await pool.query(
+    `INSERT INTO billing_events
+      (user_id, provider, purchase_type, status, amount_total, currency, external_id,
+       customer_id, subscription_id, occurred_at, metadata)
+     VALUES ($1, 'stripe', $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+     ON CONFLICT (external_id) DO UPDATE SET
+       user_id=COALESCE(EXCLUDED.user_id, billing_events.user_id),
+       status=EXCLUDED.status,
+       amount_total=COALESCE(EXCLUDED.amount_total, billing_events.amount_total),
+       currency=COALESCE(EXCLUDED.currency, billing_events.currency),
+       customer_id=COALESCE(EXCLUDED.customer_id, billing_events.customer_id),
+       subscription_id=COALESCE(EXCLUDED.subscription_id, billing_events.subscription_id),
+       occurred_at=LEAST(billing_events.occurred_at, EXCLUDED.occurred_at),
+       metadata=billing_events.metadata || EXCLUDED.metadata
+     RETURNING *`,
+    [
+      resolvedUserId,
+      String(purchaseType).slice(0, 50),
+      String(status).slice(0, 30),
+      safeAmount,
+      safeCurrency,
+      String(externalId),
+      customerId ? String(customerId) : null,
+      subscriptionId ? String(subscriptionId) : null,
+      occurredAt instanceof Date ? occurredAt : new Date(occurredAt || Date.now()),
+      JSON.stringify(safeMetadata),
+    ]
+  );
+  return rows[0] || null;
+}
+
+async function recordAdminAction(adminUserId, targetUserId, action, details = {}) {
+  await pool.query(
+    `INSERT INTO admin_audit_log (admin_user_id, target_user_id, action, details)
+     VALUES ($1, $2, $3, $4::jsonb)`,
+    [adminUserId || null, targetUserId || null, String(action).slice(0, 80), JSON.stringify(details || {})]
+  );
+}
+
+function stripeInvoiceSubscriptionId(invoice) {
+  const value = invoice?.subscription || invoice?.parent?.subscription_details?.subscription;
+  return typeof value === 'string' ? value : value?.id || null;
+}
+
+async function syncStripeHistoryForUser(userId) {
+  if (!stripe) throw new Error('Stripe is not configured');
+  const { rows } = await pool.query(
+    'SELECT id, stripe_customer_id FROM users WHERE id=$1 LIMIT 1',
+    [userId]
+  );
+  const user = rows[0];
+  if (!user) return { found: false, imported: 0 };
+  if (!user.stripe_customer_id) return { found: true, imported: 0, no_customer: true };
+
+  let imported = 0;
+  const [invoices, paymentIntents] = await Promise.all([
+    stripe.invoices.list({ customer: user.stripe_customer_id, limit: 100 }),
+    stripe.paymentIntents.list({ customer: user.stripe_customer_id, limit: 100 }),
+  ]);
+
+  for (const invoice of invoices.data || []) {
+    const paid = invoice.status === 'paid';
+    await recordBillingEvent({
+      userId: user.id,
+      customerId: user.stripe_customer_id,
+      subscriptionId: stripeInvoiceSubscriptionId(invoice),
+      purchaseType: 'subscription_invoice',
+      status: paid ? 'paid' : (invoice.status || 'open'),
+      amountTotal: paid ? (invoice.amount_paid ?? invoice.total) : (invoice.amount_due ?? invoice.total),
+      currency: invoice.currency,
+      externalId: `invoice:${invoice.id}`,
+      occurredAt: stripeOccurredAt(invoice.status_transitions?.paid_at || invoice.created),
+      metadata: { billing_reason: invoice.billing_reason || null, imported_by_admin: true },
+    });
+    imported++;
+  }
+
+  for (const paymentIntent of paymentIntents.data || []) {
+    if (paymentIntent.metadata?.purchase_type !== 'premium_onetime') continue;
+    await recordBillingEvent({
+      userId: user.id,
+      customerId: user.stripe_customer_id,
+      purchaseType: 'premium_onetime',
+      status: paymentIntent.status === 'succeeded' ? 'paid' : paymentIntent.status,
+      amountTotal: paymentIntent.amount_received || paymentIntent.amount,
+      currency: paymentIntent.currency,
+      externalId: `payment:${paymentIntent.id}`,
+      occurredAt: stripeOccurredAt(paymentIntent.created),
+      metadata: { premium_days: paymentIntent.metadata?.premium_days || null, imported_by_admin: true },
+    });
+    imported++;
+  }
+
+  return { found: true, imported };
 }
 
 async function syncStripeSubscription({ userId, customerId, subscriptionId, status }) {
@@ -512,9 +712,9 @@ async function syncStripeSubscription({ userId, customerId, subscriptionId, stat
         stripe_subscription_id=COALESCE($2, stripe_subscription_id),
         stripe_subscription_status=COALESCE($3, stripe_subscription_status),
         stripe_premium=$4,
-        is_premium=($4 OR COALESCE(discord_premium, false) OR COALESCE(premium_until, NOW()) > NOW())
+        is_premium=($4 OR COALESCE(discord_premium, false) OR COALESCE(admin_premium, false) OR COALESCE(premium_until, NOW()) > NOW())
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, tax_enabled
+    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled
   `, params);
   return rows[0] || null;
 }
@@ -530,11 +730,32 @@ async function markStripeObjectProcessed(idempotencyKey) {
   return rowCount > 0;
 }
 
-async function grantOneTimePremium({ userId, customerId, days, idempotencyKey }) {
+async function grantOneTimePremium({
+  userId,
+  customerId,
+  days,
+  idempotencyKey,
+  amountTotal,
+  currency,
+  occurredAt,
+}) {
   if (!userId && !customerId) return null;
   const shouldGrant = await markStripeObjectProcessed(idempotencyKey);
-  if (!shouldGrant && userId) return getUserAccess(Number(userId));
-  if (!shouldGrant) return null;
+  if (!shouldGrant) {
+    await recordBillingEvent({
+      userId,
+      customerId,
+      purchaseType: 'premium_onetime',
+      status: 'paid',
+      amountTotal,
+      currency,
+      externalId: idempotencyKey ? `payment:${idempotencyKey}` : null,
+      occurredAt,
+      metadata: { premium_days: days || oneTimePremiumDays() },
+    });
+    if (userId) return getUserAccess(Number(userId));
+    return null;
+  }
 
   const validDays = Math.max(Number.parseInt(days || oneTimePremiumDays(), 10) || oneTimePremiumDays(), 1);
   const params = [customerId || null, validDays];
@@ -553,9 +774,21 @@ async function grantOneTimePremium({ userId, customerId, days, idempotencyKey })
         premium_until=GREATEST(COALESCE(premium_until, NOW()), NOW()) + ($2::int * INTERVAL '1 day'),
         is_premium=TRUE
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, tax_enabled, premium_until
+    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, premium_until
   `, params);
-  return rows[0] || null;
+  const user = rows[0] || null;
+  await recordBillingEvent({
+    userId: user?.id || userId,
+    customerId,
+    purchaseType: 'premium_onetime',
+    status: 'paid',
+    amountTotal,
+    currency,
+    externalId: idempotencyKey ? `payment:${idempotencyKey}` : null,
+    occurredAt,
+    metadata: { premium_days: validDays },
+  });
+  return user;
 }
 
 async function handleStripeEvent(event) {
@@ -573,6 +806,18 @@ async function handleStripeEvent(event) {
         subscriptionId: session.subscription,
         status,
       });
+      await recordBillingEvent({
+        userId: session.client_reference_id || session.metadata?.user_id,
+        customerId: session.customer,
+        subscriptionId: session.subscription,
+        purchaseType: 'subscription',
+        status: status || 'active',
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        externalId: `checkout:${session.id}`,
+        occurredAt: stripeOccurredAt(session.created),
+        metadata: { checkout_mode: session.mode },
+      });
     }
     if (session.mode === 'payment' && (session.payment_status === 'paid' || event.type === 'checkout.session.async_payment_succeeded')) {
       await grantOneTimePremium({
@@ -580,6 +825,9 @@ async function handleStripeEvent(event) {
         customerId: session.customer,
         days: session.metadata?.premium_days,
         idempotencyKey: session.payment_intent || session.id,
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        occurredAt: stripeOccurredAt(session.created),
       });
     }
     return;
@@ -593,8 +841,42 @@ async function handleStripeEvent(event) {
         customerId: paymentIntent.customer,
         days: paymentIntent.metadata?.premium_days,
         idempotencyKey: paymentIntent.id,
+        amountTotal: paymentIntent.amount_received || paymentIntent.amount,
+        currency: paymentIntent.currency,
+        occurredAt: stripeOccurredAt(paymentIntent.created),
       });
     }
+    return;
+  }
+
+  if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
+    const invoice = event.data.object;
+    const subscriptionId = stripeInvoiceSubscriptionId(invoice);
+    let invoiceUserId = invoice.metadata?.user_id;
+    if (!invoiceUserId && subscriptionId && stripe) {
+      try {
+        const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+        invoiceUserId = subscription.metadata?.user_id;
+      } catch (err) {
+        console.error('Stripe invoice subscription lookup error:', err.message);
+      }
+    }
+    const paid = event.type === 'invoice.paid';
+    await recordBillingEvent({
+      userId: invoiceUserId,
+      customerId: invoice.customer,
+      subscriptionId,
+      purchaseType: 'subscription_invoice',
+      status: paid ? 'paid' : 'failed',
+      amountTotal: paid ? (invoice.amount_paid ?? invoice.total) : (invoice.amount_due ?? invoice.total),
+      currency: invoice.currency,
+      externalId: `invoice:${invoice.id}`,
+      occurredAt: stripeOccurredAt(invoice.status_transitions?.paid_at || invoice.created),
+      metadata: {
+        billing_reason: invoice.billing_reason || null,
+        hosted_invoice_url: invoice.hosted_invoice_url || null,
+      },
+    });
     return;
   }
 
@@ -678,7 +960,7 @@ async function checkBetAccess(req, res, next) {
 
 // ─── AUTH ROUTES ──────────────────────────────────────────────────────────────
 app.post('/api/auth/register', authLimiter, async (req, res) => {
-  const { username, email, password, language = 'pl' } = req.body;
+  const { username, email, password, language = 'pl', currency = 'PLN' } = req.body;
   const cleanUsername = normalizeText(username, 50);
   const cleanEmail = normalizeEmail(email);
   if (!cleanUsername || !cleanEmail || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -695,10 +977,10 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
 
     const hash = await bcrypt.hash(password, 12);
     const { rows } = await pool.query(
-      `INSERT INTO users (username, email, password_hash, language)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, username, email, language, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
-      [cleanUsername, cleanEmail, hash, language === 'en' ? 'en' : 'pl']
+      `INSERT INTO users (username, email, password_hash, language, currency)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, username, email, language, currency, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
+      [cleanUsername, cleanEmail, hash, normalizeLanguage(language), normalizeCurrency(currency)]
     );
     const token = signUserToken(rows[0]);
     res.json({ token, user: publicUser(rows[0]) });
@@ -743,6 +1025,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         username: rows[0].username,
         email: rows[0].email,
         language: rows[0].language,
+        currency: rows[0].currency || 'PLN',
         tax_enabled: rows[0].tax_enabled,
         is_premium: rows[0].effective_is_premium,
         is_admin: isAdminIdentity(rows[0]),
@@ -765,7 +1048,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   await pool.query('UPDATE users SET last_seen_at=NOW() WHERE id=$1', [req.user.id]).catch(() => {});
   const { rows } = await pool.query(
-    `SELECT id, username, email, language, tax_enabled,
+    `SELECT id, username, email, language, currency, tax_enabled,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -793,7 +1076,7 @@ app.post('/api/trial/activate', authMiddleware, async (req, res) => {
       `UPDATE users
        SET trial_started_at=NOW()
        WHERE id=$1 AND trial_started_at IS NULL
-       RETURNING id, username, email, avatar, language, tax_enabled, stripe_customer_id, premium_until,
+       RETURNING id, username, email, avatar, language, currency, tax_enabled, stripe_customer_id, premium_until,
                  ${effectivePremiumSql('')} AS is_premium,
                  ${trialActiveSql('')} AS trial_active,
                  ${trialAvailableSql('')} AS trial_available,
@@ -809,10 +1092,15 @@ app.post('/api/trial/activate', authMiddleware, async (req, res) => {
 });
 
 app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
-  const { language, tax_enabled } = req.body;
-  const cleanLanguage = language === 'en' ? 'en' : 'pl';
-  await pool.query('UPDATE users SET language=$1, tax_enabled=$2 WHERE id=$3', [cleanLanguage, Boolean(tax_enabled), req.user.id]);
-  res.json({ ok: true });
+  const { language, currency, tax_enabled } = req.body;
+  const { rows } = await pool.query(
+    `UPDATE users
+     SET language=$1, currency=$2, tax_enabled=$3
+     WHERE id=$4
+     RETURNING language, currency, tax_enabled`,
+    [normalizeLanguage(language), normalizeCurrency(currency), parseBoolean(tax_enabled), req.user.id]
+  );
+  res.json({ ok: true, settings: rows[0] || {} });
 });
 
 // ─── DISCORD OAUTH ────────────────────────────────────────────────────────────
@@ -830,12 +1118,23 @@ function adminUserStatsSql(whereClause = '') {
         COALESCE(SUM(stake), 0) AS total_stake,
         COALESCE(SUM(stake) FILTER (WHERE status IN ('won','lost')), 0) AS settled_stake,
         COALESCE(SUM(CASE
-          WHEN status='won' THEN stake * odds - stake
+          WHEN status='won' THEN stake * (CASE WHEN tax_enabled THEN 1 - tax_rate ELSE 1 END) * odds - stake
           WHEN status='lost' THEN -stake
           ELSE 0
         END), 0) AS profit,
         MAX(created_at) AS last_bet_at
       FROM bets
+      GROUP BY user_id
+    ),
+    billing_stats AS (
+      SELECT
+        user_id,
+        (COUNT(*) FILTER (WHERE status='paid'))::int AS payment_count,
+        COALESCE(SUM(amount_total) FILTER (WHERE status='paid'), 0)::bigint AS total_paid,
+        MIN(occurred_at) FILTER (WHERE status='paid') AS first_payment_at,
+        MAX(occurred_at) FILTER (WHERE status='paid') AS last_payment_at
+      FROM billing_events
+      WHERE user_id IS NOT NULL
       GROUP BY user_id
     )
     SELECT
@@ -844,10 +1143,15 @@ function adminUserStatsSql(whereClause = '') {
       users.email,
       users.avatar,
       users.language,
+      users.currency,
       users.tax_enabled,
       users.created_at,
       users.last_seen_at,
       users.last_login_at,
+      (users.password_hash <> '') AS has_password,
+      (users.discord_id IS NOT NULL) AS has_discord,
+      (users.google_id IS NOT NULL) AS has_google,
+      (users.facebook_id IS NOT NULL) AS has_facebook,
       users.admin_premium,
       users.discord_premium,
       users.stripe_premium,
@@ -871,9 +1175,27 @@ function adminUserStatsSql(whereClause = '') {
         THEN ROUND((COALESCE(bs.profit, 0) / bs.settled_stake * 100)::numeric, 2)
         ELSE 0
       END AS roi,
-      bs.last_bet_at
+      bs.last_bet_at,
+      COALESCE(bill.payment_count, 0)::int AS payment_count,
+      COALESCE(bill.total_paid, 0)::bigint AS total_paid,
+      bill.first_payment_at,
+      bill.last_payment_at,
+      latest_payment.purchase_type AS last_purchase_type,
+      latest_payment.status AS last_purchase_status,
+      latest_payment.amount_total AS last_purchase_amount,
+      latest_payment.currency AS last_purchase_currency,
+      latest_payment.occurred_at AS last_purchase_at
     FROM users
     LEFT JOIN bet_stats bs ON bs.user_id = users.id
+    LEFT JOIN billing_stats bill ON bill.user_id = users.id
+    LEFT JOIN LATERAL (
+      SELECT purchase_type, status, amount_total, currency, occurred_at
+      FROM billing_events
+      WHERE billing_events.user_id = users.id
+        AND billing_events.status = 'paid'
+      ORDER BY occurred_at DESC, id DESC
+      LIMIT 1
+    ) latest_payment ON TRUE
     ${whereClause}
   `;
 }
@@ -897,7 +1219,8 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
     if (search) {
       params.push(`%${search.toLowerCase()}%`);
       where = `WHERE LOWER(COALESCE(users.username, '')) LIKE $${params.length}
-               OR LOWER(COALESCE(users.email, '')) LIKE $${params.length}`;
+               OR LOWER(COALESCE(users.email, '')) LIKE $${params.length}
+               OR CAST(users.id AS TEXT) LIKE $${params.length}`;
     }
 
     const listParams = [...params, safeLimit, safeOffset];
@@ -913,14 +1236,80 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
         COUNT(*)::int AS total_users,
         (COUNT(*) FILTER (WHERE ${effectivePremiumSql('users')}))::int AS premium_users,
         (COUNT(*) FILTER (WHERE ${trialActiveSql('users')}))::int AS active_trials,
-        (COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '24 hours'))::int AS active_today
+        (COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '24 hours'))::int AS active_today,
+        (SELECT COUNT(*)::int FROM billing_events WHERE status='paid') AS paid_orders,
+        (SELECT COALESCE(SUM(amount_total), 0)::bigint FROM billing_events WHERE status='paid') AS revenue_total
       FROM users
     `);
 
-    res.json({ users: rows, summary: summaryRows[0] || {} });
+    const countParams = [...params];
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS total FROM users ${where}`,
+      countParams
+    );
+
+    res.json({
+      users: rows,
+      summary: summaryRows[0] || {},
+      pagination: {
+        total: countRows[0]?.total || 0,
+        limit: safeLimit,
+        offset: safeOffset,
+      },
+    });
   } catch (err) {
     console.error('Admin users error:', err);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.get('/api/admin/users/:id/details', authMiddleware, adminMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Invalid user id' });
+
+  try {
+    const user = await getAdminUserDetails(userId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { rows: payments } = await pool.query(
+      `SELECT id, provider, purchase_type, status, amount_total, currency,
+              external_id, occurred_at
+       FROM billing_events
+       WHERE user_id=$1
+       ORDER BY occurred_at DESC, id DESC
+       LIMIT 50`,
+      [userId]
+    );
+
+    const { rows: audit } = await pool.query(
+      `SELECT action, details, created_at
+       FROM admin_audit_log
+       WHERE target_user_id=$1
+       ORDER BY created_at DESC, id DESC
+       LIMIT 20`,
+      [userId]
+    );
+
+    res.json({ user, payments, audit });
+  } catch (err) {
+    console.error('Admin user details error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/sync-billing', authMiddleware, adminMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Invalid user id' });
+  if (!stripe) return res.status(503).json({ error: 'Stripe is not configured' });
+
+  try {
+    const result = await syncStripeHistoryForUser(userId);
+    if (!result.found) return res.status(404).json({ error: 'User not found' });
+    await recordAdminAction(req.admin?.id, userId, 'billing_sync', result);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error('Admin billing sync error:', err);
+    res.status(500).json({ error: 'Could not sync Stripe billing history' });
   }
 });
 
@@ -951,11 +1340,8 @@ app.post('/api/admin/users/:id/premium', authMiddleware, adminMiddleware, async 
       await pool.query(
         `UPDATE users
          SET admin_premium=FALSE,
-             discord_premium=FALSE,
-             stripe_premium=FALSE,
              premium_until=NULL,
-             is_premium=FALSE,
-             stripe_subscription_status=COALESCE(stripe_subscription_status, 'admin_revoked')
+             is_premium=(COALESCE(discord_premium, FALSE) OR COALESCE(stripe_premium, FALSE))
          WHERE id=$1`,
         [userId]
       );
@@ -965,6 +1351,9 @@ app.post('/api/admin/users/:id/premium', authMiddleware, adminMiddleware, async 
 
     const user = await getAdminUserDetails(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    await recordAdminAction(req.admin?.id, userId, `premium_${action}`, {
+      days: action === 'grant_days' ? Math.min(Math.max(parseInt(req.body?.days, 10) || 30, 1), 3650) : null,
+    });
     res.json({ ok: true, user });
   } catch (err) {
     console.error('Admin premium error:', err);
@@ -995,6 +1384,7 @@ app.post('/api/admin/users/:id/trial', authMiddleware, adminMiddleware, async (r
 
     const user = await getAdminUserDetails(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    await recordAdminAction(req.admin?.id, userId, `trial_${action}`);
     res.json({ ok: true, user });
   } catch (err) {
     console.error('Admin trial error:', err);
@@ -1325,6 +1715,18 @@ app.post('/api/billing/verify-session', authMiddleware, async (req, res) => {
         subscriptionId,
         status: status || 'active',
       });
+      await recordBillingEvent({
+        userId: req.user.id,
+        customerId: session.customer,
+        subscriptionId,
+        purchaseType: 'subscription',
+        status: status || 'active',
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        externalId: `checkout:${session.id}`,
+        occurredAt: stripeOccurredAt(session.created),
+        metadata: { verified_by_user: true },
+      });
     } else if (session.mode === 'payment') {
       if (session.payment_status !== 'paid') {
         return res.status(409).json({ error: 'Payment is not completed yet' });
@@ -1337,6 +1739,9 @@ app.post('/api/billing/verify-session', authMiddleware, async (req, res) => {
         customerId: session.customer,
         days: session.metadata?.premium_days,
         idempotencyKey: paymentIntentId || session.id,
+        amountTotal: session.amount_total,
+        currency: session.currency,
+        occurredAt: stripeOccurredAt(session.created),
       });
     }
 
@@ -1422,7 +1827,7 @@ app.get('/api/bets', authMiddleware, apiLimiter, async (req, res) => {
 
 // POST /api/bets — adding slips is available during trial or with Premium
 app.post('/api/bets', authMiddleware, apiLimiter, checkBetAccess, async (req, res) => {
-  const { date, bookmaker, category, stake, odds, bet_type, notes, selections, status } = req.body;
+  const { date, bookmaker, category, stake, odds, tax_enabled, bet_type, notes, selections, status } = req.body;
   const parsedStake = parsePositiveNumber(stake);
   const parsedOdds = parsePositiveNumber(odds, 1);
   const cleanStatus = status || 'pending';
@@ -1438,8 +1843,8 @@ app.post('/api/bets', authMiddleware, apiLimiter, checkBetAccess, async (req, re
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `INSERT INTO bets (user_id, date, bookmaker, category, stake, odds, bet_type, notes, selections, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      `INSERT INTO bets (user_id, date, bookmaker, category, stake, odds, tax_enabled, tax_rate, bet_type, notes, selections, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,0.12,$8,$9,$10,$11) RETURNING *`,
       [
         req.user.id,
         date,
@@ -1447,6 +1852,7 @@ app.post('/api/bets', authMiddleware, apiLimiter, checkBetAccess, async (req, re
         normalizeText(category, 50),
         parsedStake,
         parsedOdds,
+        parseBoolean(tax_enabled),
         cleanBetType,
         normalizeText(notes, 5000),
         JSON.stringify(selections || []),
@@ -1465,7 +1871,7 @@ app.post('/api/bets', authMiddleware, apiLimiter, checkBetAccess, async (req, re
 });
 
 app.patch('/api/bets/:id', authMiddleware, apiLimiter, async (req, res) => {
-  const { date, bookmaker, category, stake, odds, bet_type, status, notes, selections } = req.body;
+  const { date, bookmaker, category, stake, odds, tax_enabled, bet_type, status, notes, selections } = req.body;
   const parsedStake = stake !== undefined ? parsePositiveNumber(stake) : undefined;
   const parsedOdds = odds !== undefined ? parsePositiveNumber(odds, 1) : undefined;
 
@@ -1497,6 +1903,11 @@ app.patch('/api/bets/:id', authMiddleware, apiLimiter, async (req, res) => {
   if (odds !== undefined) {
     params.push(parsedOdds);
     updates.push(`odds=$${params.length}`);
+  }
+  if (tax_enabled !== undefined) {
+    params.push(parseBoolean(tax_enabled));
+    updates.push(`tax_enabled=$${params.length}`);
+    updates.push('tax_rate=0.12');
   }
   if (bet_type !== undefined) {
     params.push(bet_type);
@@ -1542,7 +1953,7 @@ app.get('/api/bets/stats', authMiddleware, async (req, res) => {
       COUNT(*) FILTER (WHERE status='void') as void,
       COALESCE(SUM(stake), 0) as total_stake,
       COALESCE(SUM(stake) FILTER (WHERE status='won'), 0) as won_stake,
-      COALESCE(SUM(stake * odds) FILTER (WHERE status='won'), 0) as total_won_gross,
+      COALESCE(SUM(stake * (CASE WHEN tax_enabled THEN 1 - tax_rate ELSE 1 END) * odds) FILTER (WHERE status='won'), 0) as total_won_gross,
       COALESCE(AVG(odds), 0) as avg_odds
     FROM bets WHERE user_id=$1
   `, [req.user.id]);
@@ -1583,13 +1994,17 @@ RULES:
    - "won" ONLY IF: green background/text, checkmark ✓, text "trafiony"/"wygrany"/"won"/"wygrana"
    - "lost" ONLY IF: red background/text, ✗ cross, text "przegrany"/"lost"/"przegrana"
    - "pending" = anything else, including unclear or ambiguous cases
-3. STAKE: Extract the exact number. Remove currency symbols. Use dot as decimal separator.
+3. STAKE (CRITICAL): Return the FULL amount paid by the player — usually labelled "Stawka", "Łączna stawka", "Stake" or "Total stake".
+   - If the slip shows "Stawka 20.00 zł" and "Stawka po podatku 17.60 zł", return stake "20.00", NOT "17.60".
+   - The value after deducting tax is never the player's full stake.
+   - Do not calculate or guess the full stake if it is not visible.
 4. ODDS: Total combined odds of the slip (the big number, not individual selection odds). If only one selection exists, use that selection odds.
 5. BOOKMAKER: Name of the bookmaker if visible, else null.
 6. BET TYPE: "single" (1 selection), "accumulator" (2+ selections combined), "system".
-7. NUMBERS: Return numbers as strings with dot decimal separator, without currency symbols.
-8. SELECTIONS: If a row contains two teams and one marked pick, put teams in "match" and the selected market/pick in "pick".
-9. CATEGORY: Detect sport category from the whole slip. Use Polish names only:
+7. TAX: Set "taxEnabled" to true ONLY when the slip explicitly shows a 12% stake tax, "podatek", "stawka po podatku", or both gross and after-tax stake. Otherwise false.
+8. NUMBERS: Return numbers as strings with dot decimal separator, without currency symbols.
+9. SELECTIONS: If a row contains two teams and one marked pick, put teams in "match" and the selected market/pick in "pick".
+10. CATEGORY: Detect sport category from the whole slip. Use Polish names only:
    - "Piłka nożna" for football/soccer
    - "Koszykówka" for basketball
    - "Tenis" for tennis
@@ -1597,7 +2012,7 @@ RULES:
    - if unclear or another sport, use empty string
 
 Return ONLY valid JSON, no markdown, no backticks, no explanation:
-{"bookmaker":"name or null","stake":"number","odds":"number","betType":"single|accumulator|system","date":"YYYY-MM-DD","category":"Piłka nożna|Koszykówka|Tenis|mixed categories or empty string","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
+{"bookmaker":"name or null","stake":"full amount paid","odds":"number","taxEnabled":false,"betType":"single|accumulator|system","date":"YYYY-MM-DD","category":"Piłka nożna|Koszykówka|Tenis|mixed categories or empty string","selections":[{"match":"team A vs team B","pick":"selection description","odds":"number","status":"won|lost|pending"}],"betStatus":"won|lost|pending","notes":"extra info or empty string"}`
           }
         ]
       }]
@@ -1633,6 +2048,7 @@ Return ONLY valid JSON, no markdown, no backticks, no explanation:
 
     parsed.stake = cleanNumber(parsed.stake);
     parsed.odds = cleanNumber(parsed.odds);
+    parsed.taxEnabled = parsed.taxEnabled === true || String(parsed.taxEnabled).toLowerCase() === 'true';
     parsed.betType = ['single', 'accumulator', 'system'].includes(parsed.betType) ? parsed.betType : 'single';
     const categoryText = [
       parsed.category,
