@@ -118,6 +118,8 @@ async function initDB() {
       language VARCHAR(5) DEFAULT 'pl',
       currency VARCHAR(3) DEFAULT 'PLN',
       tax_enabled BOOLEAN DEFAULT FALSE,
+      weekly_email_enabled BOOLEAN DEFAULT FALSE,
+      weekly_email_last_sent_at TIMESTAMP,
       discord_id TEXT UNIQUE,
       discord_name TEXT,
       avatar TEXT,
@@ -206,6 +208,8 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'PLN';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS weekly_email_enabled BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS weekly_email_last_sent_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
     ALTER TABLE users ALTER COLUMN trial_started_at DROP DEFAULT;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS discord_premium BOOLEAN DEFAULT FALSE;
@@ -411,6 +415,7 @@ function publicUser(row) {
     language: row.language,
     currency: row.currency || 'PLN',
     tax_enabled: row.tax_enabled,
+    weekly_email_enabled: Boolean(row.weekly_email_enabled),
   };
 }
 
@@ -450,7 +455,7 @@ function accessPayload(row) {
 
 async function getUserAccess(userId) {
   const { rows } = await pool.query(
-    `SELECT id, username, email, avatar, language, currency, tax_enabled, stripe_customer_id, premium_until,
+    `SELECT id, username, email, avatar, language, currency, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -495,7 +500,7 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
         last_seen_at=NOW()
         ${premiumSql}
     WHERE id=$4
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled, weekly_email_enabled
   `, params);
   return rows[0];
 }
@@ -528,7 +533,7 @@ async function upsertOAuthUser({ provider, providerId, username, email, avatar, 
   const { rows } = await pool.query(`
     INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium, last_login_at, last_seen_at)
     VALUES ($1, $2, $3, $4, '', $5, $6, NOW(), NOW())
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled, weekly_email_enabled
   `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
   return rows[0];
 }
@@ -539,6 +544,28 @@ function stripeActiveStatus(status) {
 
 function oneTimePremiumDays() {
   return Math.max(Number.parseInt(process.env.STRIPE_ONETIME_PREMIUM_DAYS || '30', 10) || 30, 1);
+}
+
+function publicStripePrice(price) {
+  if (!price) return null;
+  const rawAmount = price.unit_amount ?? price.unit_amount_decimal;
+  const amount = Number.isFinite(Number(rawAmount)) ? Math.round(Number(rawAmount)) : null;
+  return {
+    unit_amount: amount,
+    currency: String(price.currency || 'pln').toUpperCase(),
+    interval: price.recurring?.interval || null,
+    interval_count: price.recurring?.interval_count || null,
+  };
+}
+
+async function retrievePublicStripePrice(priceId) {
+  if (!stripe || !priceId) return null;
+  try {
+    return publicStripePrice(await stripe.prices.retrieve(priceId));
+  } catch (err) {
+    console.error('Stripe price lookup error:', err.message);
+    return null;
+  }
 }
 
 function stripeOccurredAt(unixSeconds) {
@@ -714,7 +741,7 @@ async function syncStripeSubscription({ userId, customerId, subscriptionId, stat
         stripe_premium=$4,
         is_premium=($4 OR COALESCE(discord_premium, false) OR COALESCE(admin_premium, false) OR COALESCE(premium_until, NOW()) > NOW())
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled
+    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, weekly_email_enabled
   `, params);
   return rows[0] || null;
 }
@@ -774,7 +801,7 @@ async function grantOneTimePremium({
         premium_until=GREATEST(COALESCE(premium_until, NOW()), NOW()) + ($2::int * INTERVAL '1 day'),
         is_premium=TRUE
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, premium_until
+    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, weekly_email_enabled, premium_until
   `, params);
   const user = rows[0] || null;
   await recordBillingEvent({
@@ -979,7 +1006,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO users (username, email, password_hash, language, currency)
        VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, username, email, language, currency, tax_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
+       RETURNING id, username, email, language, currency, tax_enabled, weekly_email_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
       [cleanUsername, cleanEmail, hash, normalizeLanguage(language), normalizeCurrency(currency)]
     );
     const token = signUserToken(rows[0]);
@@ -1027,6 +1054,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         language: rows[0].language,
         currency: rows[0].currency || 'PLN',
         tax_enabled: rows[0].tax_enabled,
+        weekly_email_enabled: Boolean(rows[0].weekly_email_enabled),
         is_premium: rows[0].effective_is_premium,
         is_admin: isAdminIdentity(rows[0]),
         has_stripe_customer: Boolean(rows[0].stripe_customer_id),
@@ -1048,7 +1076,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   await pool.query('UPDATE users SET last_seen_at=NOW() WHERE id=$1', [req.user.id]).catch(() => {});
   const { rows } = await pool.query(
-    `SELECT id, username, email, language, currency, tax_enabled,
+    `SELECT id, username, email, language, currency, tax_enabled, weekly_email_enabled,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -1076,7 +1104,7 @@ app.post('/api/trial/activate', authMiddleware, async (req, res) => {
       `UPDATE users
        SET trial_started_at=NOW()
        WHERE id=$1 AND trial_started_at IS NULL
-       RETURNING id, username, email, avatar, language, currency, tax_enabled, stripe_customer_id, premium_until,
+       RETURNING id, username, email, avatar, language, currency, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
                  ${effectivePremiumSql('')} AS is_premium,
                  ${trialActiveSql('')} AS trial_active,
                  ${trialAvailableSql('')} AS trial_available,
@@ -1092,15 +1120,175 @@ app.post('/api/trial/activate', authMiddleware, async (req, res) => {
 });
 
 app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
-  const { language, currency, tax_enabled } = req.body;
+  const { language, currency, tax_enabled, weekly_email_enabled } = req.body;
+  const weeklySetting = weekly_email_enabled === undefined ? null : parseBoolean(weekly_email_enabled);
   const { rows } = await pool.query(
     `UPDATE users
-     SET language=$1, currency=$2, tax_enabled=$3
-     WHERE id=$4
-     RETURNING language, currency, tax_enabled`,
-    [normalizeLanguage(language), normalizeCurrency(currency), parseBoolean(tax_enabled), req.user.id]
+     SET language=$1, currency=$2, tax_enabled=$3, weekly_email_enabled=COALESCE($4, weekly_email_enabled)
+     WHERE id=$5
+     RETURNING language, currency, tax_enabled, weekly_email_enabled`,
+    [normalizeLanguage(language), normalizeCurrency(currency), parseBoolean(tax_enabled), weeklySetting, req.user.id]
   );
   res.json({ ok: true, settings: rows[0] || {} });
+});
+
+function plainMoney(value, currency = 'PLN', language = 'pl') {
+  try {
+    return new Intl.NumberFormat(language === 'en' ? 'en-US' : 'pl-PL', {
+      style: 'currency',
+      currency: String(currency || 'PLN').toUpperCase(),
+    }).format(Number(value || 0));
+  } catch {
+    return `${Number(value || 0).toFixed(2)} ${String(currency || 'PLN').toUpperCase()}`;
+  }
+}
+
+function plainPct(value) {
+  return `${Number(value || 0).toFixed(1).replace('.', ',')}%`;
+}
+
+async function buildWeeklySummary(userId) {
+  const { rows: userRows } = await pool.query(
+    'SELECT id, username, email, language, currency, weekly_email_enabled FROM users WHERE id=$1',
+    [userId]
+  );
+  const user = userRows[0] || null;
+  if (!user) return null;
+
+  const profitSql = `CASE
+    WHEN status='won' THEN stake * (CASE WHEN tax_enabled THEN 1 - tax_rate ELSE 1 END) * odds - stake
+    WHEN status='lost' THEN -stake
+    ELSE 0
+  END`;
+
+  const { rows: summaryRows } = await pool.query(`
+    SELECT
+      COUNT(*)::int AS total,
+      (COUNT(*) FILTER (WHERE status IN ('won','lost')))::int AS settled,
+      COALESCE(SUM(stake), 0) AS stake,
+      COALESCE(SUM(${profitSql}), 0) AS profit,
+      COALESCE(SUM(stake) FILTER (WHERE status IN ('won','lost')), 0) AS settled_stake,
+      (COUNT(*) FILTER (WHERE status='pending'))::int AS pending
+    FROM bets
+    WHERE user_id=$1 AND date >= CURRENT_DATE - INTERVAL '6 days'
+  `, [userId]);
+
+  const { rows: bestRows } = await pool.query(`
+    SELECT COALESCE(NULLIF(category, ''), NULLIF(bet_type, ''), 'Inne') AS name,
+           COUNT(*)::int AS total,
+           COALESCE(SUM(${profitSql}), 0) AS profit
+    FROM bets
+    WHERE user_id=$1 AND date >= CURRENT_DATE - INTERVAL '6 days'
+    GROUP BY 1
+    ORDER BY profit DESC, total DESC
+    LIMIT 1
+  `, [userId]);
+
+  const { rows: logRows } = await pool.query(`
+    SELECT DISTINCT created_at::date AS day
+    FROM bets
+    WHERE user_id=$1 AND created_at >= NOW() - INTERVAL '60 days'
+    ORDER BY day DESC
+  `, [userId]);
+
+  const days = new Set(logRows.map(r => String(r.day).slice(0, 10)));
+  let cursor = new Date().toISOString().slice(0, 10);
+  if (!days.has(cursor) && logRows[0]?.day) cursor = String(logRows[0].day).slice(0, 10);
+  let logStreak = 0;
+  while (days.has(cursor)) {
+    logStreak++;
+    const d = new Date(`${cursor}T12:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 1);
+    cursor = d.toISOString().slice(0, 10);
+  }
+
+  const s = summaryRows[0] || {};
+  const settledStake = Number(s.settled_stake || 0);
+  const profit = Number(s.profit || 0);
+  return {
+    user,
+    total: Number(s.total || 0),
+    settled: Number(s.settled || 0),
+    pending: Number(s.pending || 0),
+    stake: Number(s.stake || 0),
+    profit,
+    roi: settledStake ? profit / settledStake * 100 : 0,
+    best: bestRows[0] || null,
+    logStreak,
+  };
+}
+
+function weeklyEmailHtml(summary) {
+  const lang = summary.user.language || 'pl';
+  const currency = summary.user.currency || 'PLN';
+  const bestName = summary.best?.name || '-';
+  return `
+    <div style="font-family:Arial,sans-serif;background:#08080e;color:#f5f2ff;padding:28px">
+      <div style="max-width:620px;margin:0 auto;background:#11111c;border:1px solid #27273a;border-radius:18px;padding:24px">
+        <h1 style="margin:0 0 8px">Twój tydzień w Typach z Piwnicy</h1>
+        <p style="color:#aaa6c3;margin:0 0 20px">Krótki raport z ostatnich 7 dni.</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div style="background:#08080e;border-radius:14px;padding:14px"><small>Profit</small><strong style="display:block;font-size:28px;color:${summary.profit >= 0 ? '#2ed17a' : '#ff5252'}">${plainMoney(summary.profit, currency, lang)}</strong></div>
+          <div style="background:#08080e;border-radius:14px;padding:14px"><small>ROI</small><strong style="display:block;font-size:28px">${plainPct(summary.roi)}</strong></div>
+          <div style="background:#08080e;border-radius:14px;padding:14px"><small>Najlepszy sport/typ</small><strong style="display:block;font-size:22px">${bestName}</strong></div>
+          <div style="background:#08080e;border-radius:14px;padding:14px"><small>Seria dodawania</small><strong style="display:block;font-size:22px">${summary.logStreak} dni</strong></div>
+        </div>
+        <p style="color:#aaa6c3;font-size:13px;margin-top:20px">To podsumowanie historii, nie porada bukmacherska ani gwarancja wyniku.</p>
+      </div>
+    </div>
+  `;
+}
+
+async function sendWeeklyEmail(summary) {
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.EMAIL_FROM || process.env.RESEND_FROM;
+  if (!apiKey || !from || !summary.user.email) return { sent: false, configured: false };
+  await axios.post('https://api.resend.com/emails', {
+    from,
+    to: summary.user.email,
+    subject: `Twój tydzień: ${plainMoney(summary.profit, summary.user.currency, summary.user.language)}, ROI ${plainPct(summary.roi)}`,
+    html: weeklyEmailHtml(summary),
+  }, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  await pool.query('UPDATE users SET weekly_email_last_sent_at=NOW() WHERE id=$1', [summary.user.id]);
+  return { sent: true, configured: true };
+}
+
+app.get('/api/summary/weekly', authMiddleware, async (req, res) => {
+  const summary = await buildWeeklySummary(req.user.id);
+  if (!summary) return res.status(404).json({ error: 'User not found' });
+  res.json(summary);
+});
+
+app.post('/api/summary/weekly/test-email', authMiddleware, async (req, res) => {
+  const summary = await buildWeeklySummary(req.user.id);
+  if (!summary) return res.status(404).json({ error: 'User not found' });
+  const result = await sendWeeklyEmail(summary);
+  res.json({ ok: true, ...result, summary });
+});
+
+app.post('/api/cron/weekly-emails', async (req, res) => {
+  const secret = process.env.WEEKLY_EMAIL_CRON_SECRET || process.env.CRON_SECRET;
+  if (!secret || req.headers['x-cron-secret'] !== secret) return res.status(401).json({ error: 'Unauthorized' });
+  const { rows: users } = await pool.query(`
+    SELECT id FROM users
+    WHERE weekly_email_enabled = TRUE
+      AND email IS NOT NULL
+      AND (weekly_email_last_sent_at IS NULL OR weekly_email_last_sent_at < NOW() - INTERVAL '6 days')
+    ORDER BY weekly_email_last_sent_at NULLS FIRST, id ASC
+    LIMIT 200
+  `);
+  let sent = 0;
+  let skipped = 0;
+  for (const user of users) {
+    const summary = await buildWeeklySummary(user.id);
+    if (!summary || !summary.total) { skipped++; continue; }
+    const result = await sendWeeklyEmail(summary);
+    if (result.sent) sent++;
+    else skipped++;
+  }
+  res.json({ ok: true, sent, skipped, considered: users.length });
 });
 
 // ─── DISCORD OAUTH ────────────────────────────────────────────────────────────
@@ -1596,6 +1784,24 @@ app.get('/api/auth/facebook/callback', async (req, res) => {
 // ─── BETS ROUTES ──────────────────────────────────────────────────────────────
 
 // ─── STRIPE BILLING ───────────────────────────────────────────────────────────
+app.get('/api/billing/prices', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'public, max-age=300');
+    const [subscription, oneTime] = await Promise.all([
+      retrievePublicStripePrice(process.env.STRIPE_PREMIUM_PRICE_ID),
+      retrievePublicStripePrice(process.env.STRIPE_ONETIME_PRICE_ID),
+    ]);
+    res.json({
+      subscription,
+      oneTime,
+      premiumDays: oneTimePremiumDays(),
+    });
+  } catch (err) {
+    console.error('Stripe public prices error:', err);
+    res.status(500).json({ error: 'Could not load prices' });
+  }
+});
+
 app.post('/api/billing/create-checkout-session', authMiddleware, async (req, res) => {
   if (!stripe || !process.env.STRIPE_PREMIUM_PRICE_ID) {
     return res.status(503).json({ error: 'Stripe is not configured' });
