@@ -101,6 +101,14 @@ const upload = multer({
     else cb(new Error('Only images allowed'));
   },
 });
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 1.5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Only PNG, JPG, WEBP or GIF avatars allowed'));
+  },
+});
 
 // ─── RATE LIMITING ────────────────────────────────────────────────────────────
 const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: 'Too many requests' } });
@@ -1140,6 +1148,32 @@ app.patch('/api/auth/settings', authMiddleware, async (req, res) => {
     [normalizeLanguage(language), normalizeCurrency(currency), parseBoolean(tax_enabled), weeklySetting, req.user.id]
   );
   res.json({ ok: true, settings: rows[0] || {} });
+});
+
+app.post('/api/auth/avatar', authMiddleware, avatarUpload.single('avatar'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No avatar provided' });
+  if (req.file.size > 1.5 * 1024 * 1024) return res.status(413).json({ error: 'Avatar is too large' });
+
+  try {
+    const dataUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+    const { rows } = await pool.query(
+      `UPDATE users
+       SET avatar=$1
+       WHERE id=$2
+       RETURNING id, username, email, avatar, language, currency, league_tier, tax_enabled, weekly_email_enabled,
+                 stripe_customer_id, premium_until,
+                 ${effectivePremiumSql('')} AS is_premium,
+                 ${trialActiveSql('')} AS trial_active,
+                 ${trialAvailableSql('')} AS trial_available,
+                 ${trialEndsSql('')} AS trial_ends_at`,
+      [dataUrl, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true, user: publicUser(rows[0]) });
+  } catch (err) {
+    console.error('Avatar upload error:', err);
+    res.status(500).json({ error: 'Could not save avatar' });
+  }
 });
 
 function plainMoney(value, currency = 'PLN', language = 'pl') {
