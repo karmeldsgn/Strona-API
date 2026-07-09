@@ -117,6 +117,7 @@ async function initDB() {
       password_hash VARCHAR(255) NOT NULL DEFAULT '',
       language VARCHAR(5) DEFAULT 'pl',
       currency VARCHAR(3) DEFAULT 'PLN',
+      league_tier VARCHAR(20) DEFAULT 'gold',
       tax_enabled BOOLEAN DEFAULT FALSE,
       weekly_email_enabled BOOLEAN DEFAULT FALSE,
       weekly_email_last_sent_at TIMESTAMP,
@@ -208,6 +209,7 @@ async function initDB() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS currency VARCHAR(3) DEFAULT 'PLN';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS league_tier VARCHAR(20) DEFAULT 'gold';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS weekly_email_enabled BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS weekly_email_last_sent_at TIMESTAMP;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP;
@@ -414,6 +416,7 @@ function publicUser(row) {
     can_add: Boolean(isPremium || trialActive),
     language: row.language,
     currency: row.currency || 'PLN',
+    league_tier: row.league_tier || 'gold',
     tax_enabled: row.tax_enabled,
     weekly_email_enabled: Boolean(row.weekly_email_enabled),
   };
@@ -453,9 +456,15 @@ function accessPayload(row) {
   };
 }
 
+const LEAGUE_TIERS = ['bronze', 'silver', 'gold', 'platinum', 'diamond', 'elite'];
+function normalizeLeagueTier(value) {
+  const tier = String(value || '').trim().toLowerCase();
+  return LEAGUE_TIERS.includes(tier) ? tier : null;
+}
+
 async function getUserAccess(userId) {
   const { rows } = await pool.query(
-    `SELECT id, username, email, avatar, language, currency, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
+    `SELECT id, username, email, avatar, language, currency, league_tier, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -500,7 +509,7 @@ async function updateOAuthUser(id, providerColumn, providerId, email, avatar, is
         last_seen_at=NOW()
         ${premiumSql}
     WHERE id=$4
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled, weekly_email_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, league_tier, tax_enabled, weekly_email_enabled
   `, params);
   return rows[0];
 }
@@ -533,7 +542,7 @@ async function upsertOAuthUser({ provider, providerId, username, email, avatar, 
   const { rows } = await pool.query(`
     INSERT INTO users (${providerColumn}, username, email, avatar, password_hash, is_premium, discord_premium, last_login_at, last_seen_at)
     VALUES ($1, $2, $3, $4, '', $5, $6, NOW(), NOW())
-    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, tax_enabled, weekly_email_enabled
+    RETURNING id, username, email, avatar, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, language, currency, league_tier, tax_enabled, weekly_email_enabled
   `, [providerId, finalUsername, cleanEmail, avatar || null, discordPremium, discordPremium]);
   return rows[0];
 }
@@ -741,7 +750,7 @@ async function syncStripeSubscription({ userId, customerId, subscriptionId, stat
         stripe_premium=$4,
         is_premium=($4 OR COALESCE(discord_premium, false) OR COALESCE(admin_premium, false) OR COALESCE(premium_until, NOW()) > NOW())
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, weekly_email_enabled
+        RETURNING id, username, email, avatar, is_premium, language, currency, league_tier, tax_enabled, weekly_email_enabled
   `, params);
   return rows[0] || null;
 }
@@ -801,7 +810,7 @@ async function grantOneTimePremium({
         premium_until=GREATEST(COALESCE(premium_until, NOW()), NOW()) + ($2::int * INTERVAL '1 day'),
         is_premium=TRUE
     WHERE ${where}
-    RETURNING id, username, email, avatar, is_premium, language, currency, tax_enabled, weekly_email_enabled, premium_until
+        RETURNING id, username, email, avatar, is_premium, language, currency, league_tier, tax_enabled, weekly_email_enabled, premium_until
   `, params);
   const user = rows[0] || null;
   await recordBillingEvent({
@@ -1006,7 +1015,7 @@ app.post('/api/auth/register', authLimiter, async (req, res) => {
     const { rows } = await pool.query(
       `INSERT INTO users (username, email, password_hash, language, currency)
        VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, username, email, language, currency, tax_enabled, weekly_email_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
+      RETURNING id, username, email, language, currency, league_tier, tax_enabled, weekly_email_enabled, ${effectivePremiumSql('')} AS is_premium, ${trialActiveSql('')} AS trial_active, ${trialAvailableSql('')} AS trial_available, ${trialEndsSql('')} AS trial_ends_at, stripe_customer_id, premium_until, avatar`,
       [cleanUsername, cleanEmail, hash, normalizeLanguage(language), normalizeCurrency(currency)]
     );
     const token = signUserToken(rows[0]);
@@ -1051,9 +1060,10 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
         id: rows[0].id,
         username: rows[0].username,
         email: rows[0].email,
-        language: rows[0].language,
-        currency: rows[0].currency || 'PLN',
-        tax_enabled: rows[0].tax_enabled,
+      language: rows[0].language,
+      currency: rows[0].currency || 'PLN',
+      league_tier: rows[0].league_tier || 'gold',
+      tax_enabled: rows[0].tax_enabled,
         weekly_email_enabled: Boolean(rows[0].weekly_email_enabled),
         is_premium: rows[0].effective_is_premium,
         is_admin: isAdminIdentity(rows[0]),
@@ -1076,7 +1086,7 @@ app.post('/api/auth/login', authLimiter, async (req, res) => {
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   await pool.query('UPDATE users SET last_seen_at=NOW() WHERE id=$1', [req.user.id]).catch(() => {});
   const { rows } = await pool.query(
-    `SELECT id, username, email, language, currency, tax_enabled, weekly_email_enabled,
+      `SELECT id, username, email, language, currency, league_tier, tax_enabled, weekly_email_enabled,
             ${effectivePremiumSql('users')} AS is_premium,
             ${trialActiveSql('users')} AS trial_active,
             ${trialAvailableSql('users')} AS trial_available,
@@ -1104,7 +1114,7 @@ app.post('/api/trial/activate', authMiddleware, async (req, res) => {
       `UPDATE users
        SET trial_started_at=NOW()
        WHERE id=$1 AND trial_started_at IS NULL
-       RETURNING id, username, email, avatar, language, currency, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
+        RETURNING id, username, email, avatar, language, currency, league_tier, tax_enabled, weekly_email_enabled, stripe_customer_id, premium_until,
                  ${effectivePremiumSql('')} AS is_premium,
                  ${trialActiveSql('')} AS trial_active,
                  ${trialAvailableSql('')} AS trial_available,
@@ -1332,6 +1342,7 @@ function adminUserStatsSql(whereClause = '') {
       users.avatar,
       users.language,
       users.currency,
+      users.league_tier,
       users.tax_enabled,
       users.created_at,
       users.last_seen_at,
@@ -1426,7 +1437,13 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
         (COUNT(*) FILTER (WHERE ${trialActiveSql('users')}))::int AS active_trials,
         (COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '24 hours'))::int AS active_today,
         (SELECT COUNT(*)::int FROM billing_events WHERE status='paid') AS paid_orders,
-        (SELECT COALESCE(SUM(amount_total), 0)::bigint FROM billing_events WHERE status='paid') AS revenue_total
+        (SELECT COALESCE(SUM(amount_total), 0)::bigint FROM billing_events WHERE status='paid') AS revenue_total,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='bronze'))::int AS league_bronze,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='silver'))::int AS league_silver,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='gold'))::int AS league_gold,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='platinum'))::int AS league_platinum,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='diamond'))::int AS league_diamond,
+        (COUNT(*) FILTER (WHERE COALESCE(league_tier, 'gold')='elite'))::int AS league_elite
       FROM users
     `);
 
@@ -1545,6 +1562,35 @@ app.post('/api/admin/users/:id/premium', authMiddleware, adminMiddleware, async 
     res.json({ ok: true, user });
   } catch (err) {
     console.error('Admin premium error:', err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/admin/users/:id/league', authMiddleware, adminMiddleware, async (req, res) => {
+  const userId = parseInt(req.params.id, 10);
+  const leagueTier = normalizeLeagueTier(req.body?.league_tier || req.body?.tier || req.body?.league);
+  if (!Number.isInteger(userId) || userId <= 0) return res.status(400).json({ error: 'Invalid user id' });
+  if (!leagueTier) return res.status(400).json({ error: 'Invalid league tier' });
+
+  try {
+    const { rows: beforeRows } = await pool.query('SELECT league_tier FROM users WHERE id=$1', [userId]);
+    if (!beforeRows.length) return res.status(404).json({ error: 'User not found' });
+
+    await pool.query(
+      `UPDATE users
+       SET league_tier=$2
+       WHERE id=$1`,
+      [userId, leagueTier]
+    );
+
+    const user = await getAdminUserDetails(userId);
+    await recordAdminAction(req.admin?.id, userId, 'league_set', {
+      from: beforeRows[0].league_tier || 'gold',
+      to: leagueTier,
+    });
+    res.json({ ok: true, user });
+  } catch (err) {
+    console.error('Admin league error:', err);
     res.status(500).json({ error: 'Server error' });
   }
 });
