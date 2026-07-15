@@ -1383,6 +1383,8 @@ function adminUserStatsSql(whereClause = '') {
       users.last_login_at,
       (users.password_hash <> '') AS has_password,
       (users.discord_id IS NOT NULL) AS has_discord,
+      users.discord_id,
+      users.discord_name,
       (users.google_id IS NOT NULL) AS has_google,
       (users.facebook_id IS NOT NULL) AS has_facebook,
       users.admin_premium,
@@ -1446,15 +1448,26 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
     const safeLimit = Math.min(Math.max(parseInt(req.query.limit, 10) || 80, 1), 200);
     const safeOffset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const search = normalizeText(req.query.search, 100);
+    const provider = String(req.query.provider || '').trim().toLowerCase();
     const params = [];
-    let where = '';
+    const conditions = [];
 
     if (search) {
       params.push(`%${search.toLowerCase()}%`);
-      where = `WHERE LOWER(COALESCE(users.username, '')) LIKE $${params.length}
-               OR LOWER(COALESCE(users.email, '')) LIKE $${params.length}
-               OR CAST(users.id AS TEXT) LIKE $${params.length}`;
+      conditions.push(`(
+        LOWER(COALESCE(users.username, '')) LIKE $${params.length}
+        OR LOWER(COALESCE(users.email, '')) LIKE $${params.length}
+        OR LOWER(COALESCE(users.discord_name, '')) LIKE $${params.length}
+        OR COALESCE(users.discord_id, '') LIKE $${params.length}
+        OR CAST(users.id AS TEXT) LIKE $${params.length}
+      )`);
     }
+
+    if (provider === 'discord') conditions.push('users.discord_id IS NOT NULL');
+    if (provider === 'password') conditions.push("COALESCE(users.password_hash, '') <> ''");
+    if (provider === 'google') conditions.push('users.google_id IS NOT NULL');
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const listParams = [...params, safeLimit, safeOffset];
     const { rows } = await pool.query(
@@ -1467,6 +1480,7 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, async (req, res) =>
     const { rows: summaryRows } = await pool.query(`
       SELECT
         COUNT(*)::int AS total_users,
+        (COUNT(*) FILTER (WHERE discord_id IS NOT NULL))::int AS discord_users,
         (COUNT(*) FILTER (WHERE ${effectivePremiumSql('users')}))::int AS premium_users,
         (COUNT(*) FILTER (WHERE ${trialActiveSql('users')}))::int AS active_trials,
         (COUNT(*) FILTER (WHERE last_seen_at > NOW() - INTERVAL '24 hours'))::int AS active_today,
@@ -1713,10 +1727,17 @@ app.get('/api/auth/discord/callback', async (req, res) => {
       provider: 'discord',
       providerId: d.id,
       username: d.username,
-      email: d.email || null,
+      email: d.verified ? d.email : null,
       avatar,
       isPremium,
     });
+
+    // Zachowaj tożsamość Discord także wtedy, gdy konto zostało połączone
+    // z wcześniejszym kontem serwisu na podstawie tego samego adresu e-mail.
+    await pool.query(
+      'UPDATE users SET discord_name=$1 WHERE id=$2',
+      [normalizeText(d.global_name || d.username, 100), user.id]
+    );
 
     // 6. Wygeneruj JWT (używamy tego samego formatu co reszta: { id, username })
     const token = signUserToken(user);
